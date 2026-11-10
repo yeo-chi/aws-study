@@ -1,0 +1,277 @@
+
+<h1 class="chapter"><span class="no">CHAPTER 0</span>이 교재를 공부하는 방법</h1>
+
+<h2>학습 순서</h2>
+<p>AWS는 서비스가 200개가 넘지만, 인프라 엔지니어가 반드시 알아야 할 핵심은 생각보다 적습니다. 이 교재는 <strong>"네트워크 → 권한(IAM) → VPC → 그 위에 올라가는 서비스"</strong> 순서로 구성되어 있습니다. 이유는 간단합니다. AWS에서 장애·보안사고·연결 문제의 80% 이상은 <strong>네트워크 설정</strong>과 <strong>권한 설정</strong>에서 발생하기 때문입니다.</p>
+<table>
+<tr><th style="width:22%">단계</th><th>범위</th><th style="width:22%">목표 기간(권장)</th></tr>
+<tr><td>1. 기초 다지기</td><td>0~3장: 클라우드 개념, 네트워크 기초, IAM</td><td>1~2주</td></tr>
+<tr><td>2. 네트워크 핵심</td><td>4~5장: VPC 기본/심화 — <strong>가장 중요</strong>, 그림을 직접 그려보며 학습</td><td>2~3주</td></tr>
+<tr><td>3. 서비스 이해</td><td>6~13장: 컴퓨팅, LB, 스토리지, DB, DNS/CDN, 보안, 모니터링, 통합</td><td>3~4주</td></tr>
+<tr><td>4. 자동화·설계</td><td>14~15장: IaC, 고가용성/DR, 비용</td><td>1~2주</td></tr>
+<tr><td>5. 실전</td><td>16~17장: 직접 구축하고 일부러 망가뜨려 보며 트러블슈팅</td><td>1~2주</td></tr>
+</table>
+
+<h2>실습 계정 준비 & 비용 사고 방지</h2>
+<ol>
+<li><strong>루트 계정 보호</strong>: 가입 직후 루트 계정에 MFA를 설정하고, 루트 액세스 키는 절대 만들지 않습니다. 일상 작업은 IAM Identity Center 사용자(또는 IAM 사용자)로 합니다.</li>
+<li><strong>예산 알림(AWS Budgets)</strong>: 월 예산(예: 10 USD)을 만들고 80%/100% 도달 시 이메일 알림을 받도록 설정합니다.</li>
+<li><strong>프리 티어 확인</strong>: 프리 티어 범위는 계정 생성 시점에 따라 다릅니다(2025년 7월 이후 신규 계정은 크레딧 기반 모델). Billing 콘솔에서 본인 계정 조건을 확인하세요.</li>
+<li><strong>비싼 "숨은 비용" 주의</strong>: NAT Gateway(시간당 + GB당 과금), 퍼블릭 IPv4 주소(2024년 2월부터 사용 중인 모든 퍼블릭 IPv4에 시간당 과금), 켜놓은 RDS/EKS 클러스터, 삭제하지 않은 EBS 스냅샷, Elastic IP 미연결 상태.</li>
+<li><strong>실습 후 정리</strong>: 실습 리소스는 태그(<code>Project=study</code>)를 붙이고, 끝나면 Terraform/CloudFormation으로 한 번에 삭제하는 습관을 들입니다.</li>
+</ol>
+<div class="box warn"><b class="t">⚠ 경고: 액세스 키 유출</b>GitHub 등 공개 저장소에 액세스 키를 올리면 수 분 안에 봇이 탐지해 채굴용 인스턴스를 대량으로 띄웁니다. 키는 코드에 넣지 말고, 가능하면 장기 키 대신 IAM 역할·SSO(임시 자격 증명)를 사용하세요.</div>
+
+<h2>AWS CLI 설정</h2>
+<pre><span class="c"># 설치 확인</span>
+aws --version
+<span class="c"># IAM Identity Center(SSO) 방식 — 권장</span>
+aws configure sso
+aws sso login --profile study
+<span class="c"># 현재 누구로 인증되어 있는지 확인 (가장 자주 쓰는 명령)</span>
+aws sts get-caller-identity --profile study
+<span class="c"># 기본 리전 설정 (서울 리전)</span>
+export AWS_DEFAULT_REGION=ap-northeast-2
+export AWS_PROFILE=study</pre>
+
+<div class="box note"><b class="t">ℹ 이 교재의 표기</b><b>💡 팁</b>은 실무 요령, <b>⚠ 경고</b>는 자주 하는 실수, <b>ℹ 참고</b>는 배경 지식, <b>📝 확인 문제</b>는 장 끝 복습 문제입니다(정답은 부록). <code>[SAA]</code>, <code>[ANS]</code>는 해당 자격증 시험 빈출 포인트입니다.</div>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 1</span>클라우드와 AWS 개요</h1>
+<div class="goal"><b>학습 목표</b> · 클라우드 서비스 모델을 구분한다 · 리전/가용 영역/엣지 로케이션의 차이와 선택 기준을 설명한다 · 공동 책임 모델로 "누가 무엇을 지키는지" 판단한다 · Well-Architected 6대 원칙을 안다</div>
+
+<h2>1.1 클라우드 컴퓨팅이란</h2>
+<p>클라우드 컴퓨팅은 <strong>컴퓨팅 자원(서버, 스토리지, 네트워크, DB 등)을 인터넷을 통해 필요할 때 빌려 쓰고 쓴 만큼 비용을 내는 모델</strong>입니다. 온프레미스(자체 데이터센터)와 비교하면 다음과 같은 차이가 있습니다.</p>
+<table>
+<tr><th>항목</th><th>온프레미스</th><th>클라우드(AWS)</th></tr>
+<tr><td>초기 비용</td><td>서버·랙·네트워크 장비 구매(CAPEX)</td><td>없음, 사용량 기반(OPEX)</td></tr>
+<tr><td>용량 계획</td><td>최대 피크 기준으로 미리 구매 → 유휴 자원 발생</td><td>수요에 따라 자동 확장/축소(Auto Scaling)</td></tr>
+<tr><td>구축 속도</td><td>장비 조달에 수 주~수 개월</td><td>수 분</td></tr>
+<tr><td>글로벌 확장</td><td>해외 IDC 계약 필요</td><td>리전 선택만으로 즉시</td></tr>
+<tr><td>책임 범위</td><td>물리 보안부터 애플리케이션까지 전부</td><td>공동 책임 모델에 따라 분담</td></tr>
+</table>
+
+<h3>서비스 모델: IaaS / PaaS / SaaS</h3>
+<table>
+<tr><th>모델</th><th>사용자가 관리</th><th>AWS가 관리</th><th>AWS 예시</th></tr>
+<tr><td><strong>IaaS</strong></td><td>OS, 런타임, 앱, 데이터, 네트워크 설정</td><td>물리 서버, 하이퍼바이저, 데이터센터</td><td>EC2, VPC, EBS</td></tr>
+<tr><td><strong>PaaS</strong></td><td>애플리케이션 코드, 데이터</td><td>OS 패치, 런타임, 확장</td><td>Elastic Beanstalk, RDS, Lambda(FaaS)</td></tr>
+<tr><td><strong>SaaS</strong></td><td>사용 설정, 데이터</td><td>전부</td><td>Amazon WorkMail, QuickSight</td></tr>
+</table>
+<p>배포 모델은 <strong>퍼블릭 클라우드</strong>, <strong>프라이빗 클라우드</strong>, 그리고 둘을 연결한 <strong>하이브리드 클라우드</strong>(VPN/Direct Connect로 온프레미스와 AWS 연결)가 있습니다.</p>
+
+<h2>1.2 AWS 글로벌 인프라</h2>
+<div class="fig">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK KR" font-size="12">
+  <rect x="10" y="10" width="470" height="280" rx="12" fill="#fff7ed" stroke="#e47911" stroke-width="2"/>
+  <text x="25" y="35" font-weight="700" fill="#b45309" font-size="14">리전 (Region) 예: ap-northeast-2 (서울)</text>
+  <g>
+    <rect x="30" y="55" width="135" height="160" rx="10" fill="#e8f1ff" stroke="#1f6feb"/>
+    <text x="45" y="77" font-weight="700" fill="#1f4fbf">AZ  ap-northeast-2a</text>
+    <rect x="45" y="90" width="105" height="40" rx="5" fill="#fff" stroke="#8aa"/><text x="58" y="115">데이터센터 1</text>
+    <rect x="45" y="140" width="105" height="40" rx="5" fill="#fff" stroke="#8aa"/><text x="58" y="165">데이터센터 2</text>
+    <rect x="175" y="55" width="135" height="160" rx="10" fill="#e8f1ff" stroke="#1f6feb"/>
+    <text x="190" y="77" font-weight="700" fill="#1f4fbf">AZ  ap-northeast-2b</text>
+    <rect x="190" y="90" width="105" height="40" rx="5" fill="#fff" stroke="#8aa"/><text x="203" y="115">데이터센터 …</text>
+    <rect x="320" y="55" width="135" height="160" rx="10" fill="#e8f1ff" stroke="#1f6feb"/>
+    <text x="335" y="77" font-weight="700" fill="#1f4fbf">AZ  ap-northeast-2c</text>
+    <rect x="335" y="90" width="105" height="40" rx="5" fill="#fff" stroke="#8aa"/><text x="348" y="115">데이터센터 …</text>
+    <line x1="165" y1="200" x2="175" y2="200" stroke="#e47911" stroke-width="3"/>
+    <line x1="310" y1="200" x2="320" y2="200" stroke="#e47911" stroke-width="3"/>
+  </g>
+  <text x="30" y="242" fill="#444">• AZ 간: 저지연(대개 수 ms 이내) 전용 광 네트워크, 물리적으로 수 km~수십 km 분리</text>
+  <text x="30" y="264" fill="#444">• 각 AZ는 독립된 전력·냉각·네트워크 → 한 AZ 장애가 다른 AZ로 전파되지 않음</text>
+  <rect x="500" y="10" width="210" height="130" rx="12" fill="#eefbf1" stroke="#2e8b57" stroke-width="2"/>
+  <text x="515" y="35" font-weight="700" fill="#1f6b43" font-size="13">엣지 로케이션 (PoP)</text>
+  <text x="515" y="60">CloudFront 캐시</text>
+  <text x="515" y="80">Route 53 DNS 응답</text>
+  <text x="515" y="100">Global Accelerator 진입점</text>
+  <text x="515" y="120">Shield / WAF 적용</text>
+  <rect x="500" y="155" width="210" height="135" rx="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+  <text x="515" y="180" font-weight="700" fill="#5b21b6" font-size="13">확장 인프라</text>
+  <text x="515" y="205">Local Zones (도시 근접)</text>
+  <text x="515" y="225">Wavelength (5G 엣지)</text>
+  <text x="515" y="245">Outposts (내 IDC에 AWS 랙)</text>
+  <text x="515" y="265">Dedicated Local Zones</text>
+</svg>
+<div class="cap">그림 1-1. 리전 – 가용 영역(AZ) – 데이터센터의 관계와 엣지 인프라</div>
+</div>
+
+<h3>리전(Region)</h3>
+<p>리전은 지리적으로 분리된 지역으로, <strong>최소 3개 이상의 가용 영역</strong>으로 구성됩니다. 리전끼리는 완전히 독립되어 있어, 데이터는 사용자가 명시적으로 복제하지 않는 한 리전을 벗어나지 않습니다(데이터 주권). 한국에는 <code>ap-northeast-2</code>(서울) 리전이 있으며 4개의 AZ를 제공합니다.</p>
+<h4>리전 선택 기준 4가지</h4>
+<ol>
+<li><strong>규정 준수</strong>: 개인정보·금융 데이터의 국외 이전 제한(데이터 주권)</li>
+<li><strong>지연 시간</strong>: 사용자와 가까운 리전일수록 응답이 빠름</li>
+<li><strong>서비스 가용성</strong>: 신규 서비스는 일부 리전에서 먼저 출시됨</li>
+<li><strong>가격</strong>: 리전별로 단가가 다름(일반적으로 us-east-1이 저렴한 편)</li>
+</ol>
+
+<h3>가용 영역(Availability Zone, AZ)</h3>
+<p>AZ는 하나 이상의 독립된 데이터센터 묶음입니다. <strong>고가용성의 기본 단위</strong>이며, 운영 서비스는 반드시 <strong>2개 이상의 AZ</strong>에 분산 배치해야 합니다.</p>
+<div class="box warn"><b class="t">⚠ AZ 이름 ≠ 물리 위치</b><code>ap-northeast-2a</code>라는 이름은 계정마다 실제 물리 AZ에 다르게 매핑될 수 있습니다(특정 AZ에 부하가 몰리는 것을 막기 위해). 여러 계정 간에 같은 물리 AZ를 맞춰야 할 때는 <strong>AZ ID</strong>(예: <code>apne2-az1</code>)를 사용하세요. <code>aws ec2 describe-availability-zones</code>로 확인할 수 있습니다.</div>
+
+<h3>글로벌 서비스 vs 리전 서비스</h3>
+<table>
+<tr><th>범위</th><th>서비스</th></tr>
+<tr><td>글로벌</td><td>IAM, Route 53, CloudFront, WAF(CloudFront용), Organizations, Global Accelerator</td></tr>
+<tr><td>리전</td><td>VPC, S3(버킷은 리전에 생성되지만 이름은 전 세계 고유), DynamoDB, Lambda, ELB, RDS 등 대부분</td></tr>
+<tr><td>AZ</td><td>EC2 인스턴스, EBS 볼륨, 서브넷, NAT Gateway(존 단위)</td></tr>
+</table>
+
+<h2>1.3 공동 책임 모델 (Shared Responsibility Model)</h2>
+<p>AWS는 <strong>"클라우드 <u>의</u> 보안(Security OF the cloud)"</strong>, 고객은 <strong>"클라우드 <u>안에서의</u> 보안(Security IN the cloud)"</strong>을 책임집니다.</p>
+<table>
+<tr><th style="width:50%">AWS 책임</th><th>고객 책임</th></tr>
+<tr><td>데이터센터 물리 보안, 하드웨어, 하이퍼바이저, 글로벌 네트워크 인프라, 관리형 서비스의 OS 패치(RDS, Lambda 등)</td><td>IAM 권한 관리, 데이터 암호화 설정, 보안 그룹/NACL, EC2 게스트 OS 패치, 애플리케이션 보안, 백업 정책</td></tr>
+</table>
+<p>서비스가 관리형(추상화)일수록 고객 책임이 줄어듭니다. 예를 들어 EC2에서는 OS 패치가 고객 몫이지만, RDS에서는 AWS가 DB 엔진 패치를 수행합니다(시점 선택은 고객). 하지만 <strong>데이터와 접근 권한은 어떤 서비스에서도 항상 고객 책임</strong>입니다.</p>
+
+<h2>1.4 AWS Well-Architected Framework</h2>
+<p>AWS가 제시하는 좋은 아키텍처의 6대 원칙(Pillar)입니다. 설계 리뷰 시 체크리스트로 활용됩니다.</p>
+<table>
+<tr><th style="width:22%">원칙</th><th>핵심 질문</th><th style="width:34%">대표 실천</th></tr>
+<tr><td>운영 우수성</td><td>변경을 안전하게, 자주 배포하고 운영 상황을 파악하는가?</td><td>IaC, 작은 단위의 잦은 배포, 런북, 관측성</td></tr>
+<tr><td>보안</td><td>자격 증명·데이터·네트워크를 계층별로 보호하는가?</td><td>최소 권한, 전 계층 보안, 암호화, 추적성</td></tr>
+<tr><td>안정성</td><td>장애에서 자동으로 복구되는가?</td><td>Multi-AZ, 자동 복구, 백업, 한도(Quota) 관리</td></tr>
+<tr><td>성능 효율성</td><td>요구에 맞는 자원을 효율적으로 쓰는가?</td><td>서버리스, 캐시, 적절한 인스턴스 유형</td></tr>
+<tr><td>비용 최적화</td><td>불필요한 비용 없이 가치를 제공하는가?</td><td>Right-sizing, Savings Plans, 유휴 자원 제거</td></tr>
+<tr><td>지속 가능성</td><td>환경 영향을 최소화하는가?</td><td>Graviton, 사용률 극대화, 관리형 서비스</td></tr>
+</table>
+
+<div class="box quiz"><b class="t">📝 확인 문제 1</b>
+1) 서울 리전에 웹 서비스를 운영합니다. 한 데이터센터의 전력 장애에도 서비스가 유지되게 하려면 최소한 무엇을 해야 할까요?<br>
+2) EC2 위에 직접 설치한 MySQL의 보안 패치는 누구 책임일까요? RDS MySQL이라면?<br>
+3) 두 개의 AWS 계정에서 "같은 물리 AZ"에 리소스를 두려면 무엇을 기준으로 맞춰야 하나요?</div>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 2</span>네트워크 기초 (AWS를 위한)</h1>
+<div class="goal"><b>학습 목표</b> · OSI 7계층과 AWS 서비스를 매핑한다 · CIDR 표기를 읽고 서브넷을 직접 계산한다 · 라우팅 테이블의 "가장 긴 접두사 일치" 규칙을 이해한다 · NAT, DNS, TCP 핸드셰이크, TLS를 설명한다</div>
+
+<h2>2.1 OSI 7계층과 TCP/IP 모델</h2>
+<table>
+<tr><th style="width:8%">계층</th><th style="width:16%">이름</th><th>역할 / 데이터 단위</th><th style="width:30%">AWS에서 관련된 것</th></tr>
+<tr><td>7</td><td>응용</td><td>HTTP, DNS, SMTP 등 / 메시지</td><td>ALB, CloudFront, WAF, API Gateway, Route 53</td></tr>
+<tr><td>6</td><td>표현</td><td>암호화, 인코딩(TLS가 걸치는 영역)</td><td>ACM 인증서, TLS 종료</td></tr>
+<tr><td>5</td><td>세션</td><td>세션 관리</td><td>—</td></tr>
+<tr><td>4</td><td>전송</td><td>TCP/UDP, 포트 번호 / 세그먼트</td><td>NLB, 보안 그룹·NACL의 포트 규칙</td></tr>
+<tr><td>3</td><td>네트워크</td><td>IP 주소, 라우팅 / 패킷</td><td>VPC, 서브넷, 라우트 테이블, TGW, GWLB</td></tr>
+<tr><td>2</td><td>데이터링크</td><td>MAC 주소, 이더넷 / 프레임</td><td>ENI의 MAC (VPC는 L2 브로드캐스트를 지원하지 않음)</td></tr>
+<tr><td>1</td><td>물리</td><td>전기·광 신호</td><td>Direct Connect의 광 회선</td></tr>
+</table>
+<div class="box note"><b class="t">ℹ VPC는 "L3 네트워크"</b>VPC에는 브로드캐스트/멀티캐스트가 기본적으로 없습니다(멀티캐스트는 Transit Gateway에서 별도 지원). ARP 요청도 AWS 하이퍼바이저(Nitro)가 대신 응답합니다. 그래서 온프레미스의 VRRP/HSRP 같은 L2 기반 가용성 기법은 그대로 쓸 수 없고, 대신 로드밸런서나 라우트 테이블 변경, Elastic IP 재할당 방식을 씁니다.</div>
+
+<h2>2.2 IPv4 주소와 CIDR</h2>
+<p>IPv4 주소는 32비트이며 8비트씩 4개로 나눠 <code>10.0.1.25</code>처럼 표기합니다. <strong>CIDR(Classless Inter-Domain Routing)</strong> 표기 <code>10.0.0.0/16</code>에서 <code>/16</code>은 "앞의 16비트가 네트워크 부분"이라는 뜻입니다. 나머지 16비트가 호스트 부분이므로 2<sup>16</sup> = 65,536개의 주소를 가집니다.</p>
+<pre>10.0.0.0/16
+  10       .0        .0        .0
+  00001010 .00000000 | 00000000 .00000000
+  └──── 네트워크 16비트 ────┘ └── 호스트 16비트 ──┘
+  범위: 10.0.0.0 ~ 10.0.255.255  (65,536개)
+서브넷 마스크로는 255.255.0.0</pre>
+
+<h3>자주 쓰는 프리픽스 크기</h3>
+<table>
+<tr><th>CIDR</th><th>주소 수</th><th>AWS 서브넷에서 사용 가능</th><th>용도 예시</th></tr>
+<tr><td>/16</td><td>65,536</td><td>65,531</td><td>VPC 최대 크기</td></tr>
+<tr><td>/20</td><td>4,096</td><td>4,091</td><td>기본 VPC의 서브넷, EKS 파드용 큰 서브넷</td></tr>
+<tr><td>/22</td><td>1,024</td><td>1,019</td><td>프라이빗 앱 서브넷</td></tr>
+<tr><td>/24</td><td>256</td><td>251</td><td>일반적인 서브넷</td></tr>
+<tr><td>/26</td><td>64</td><td>59</td><td>DB, 엔드포인트 서브넷</td></tr>
+<tr><td>/28</td><td>16</td><td>11</td><td>AWS 서브넷 최소 크기, TGW 연결 서브넷</td></tr>
+<tr><td>/32</td><td>1</td><td>—</td><td>단일 호스트(보안 그룹 규칙에서 특정 IP 지정)</td></tr>
+</table>
+<p><strong>공식</strong>: 주소 수 = 2<sup>(32 − 프리픽스)</sup>. 프리픽스가 1 커지면 크기는 절반이 됩니다.</p>
+
+<h3>사설 IP 대역 (RFC 1918)</h3>
+<table>
+<tr><th>대역</th><th>범위</th><th>비고</th></tr>
+<tr><td>10.0.0.0/8</td><td>10.0.0.0 – 10.255.255.255</td><td>가장 큼, 대규모 기업망에서 주로 사용</td></tr>
+<tr><td>172.16.0.0/12</td><td>172.16.0.0 – 172.31.255.255</td><td>AWS 기본 VPC가 172.31.0.0/16 사용</td></tr>
+<tr><td>192.168.0.0/16</td><td>192.168.0.0 – 192.168.255.255</td><td>가정용 공유기에서 흔함 → VPN 충돌 주의</td></tr>
+</table>
+<p>그 밖에 <code>100.64.0.0/10</code>(CGNAT, RFC 6598)도 VPC 보조 CIDR로 쓸 수 있으며, EKS에서 파드 IP 고갈 문제 해결용으로 자주 활용됩니다. <code>169.254.0.0/16</code>은 링크 로컬로, AWS에서는 <code>169.254.169.254</code>(인스턴스 메타데이터), <code>169.254.169.253</code>(DNS) 등에 쓰입니다.</p>
+
+<h3>서브넷팅 실전 계산</h3>
+<p><strong>문제</strong>: <code>10.10.0.0/16</code> VPC를 3개 AZ × (퍼블릭, 프라이빗 앱, 프라이빗 DB) = 9개 서브넷으로 나누되, 앱 서브넷을 가장 크게 하고 싶다.</p>
+<pre><span class="c"># 앱 서브넷: /20 (4,096개) × 3</span>
+10.10.0.0/20    app-a   (10.10.0.0  ~ 10.10.15.255)
+10.10.16.0/20   app-b   (10.10.16.0 ~ 10.10.31.255)
+10.10.32.0/20   app-c   (10.10.32.0 ~ 10.10.47.255)
+<span class="c"># 퍼블릭 서브넷: /24 (256개) × 3 — LB, NAT GW 정도만 들어가므로 작게</span>
+10.10.48.0/24   pub-a
+10.10.49.0/24   pub-b
+10.10.50.0/24   pub-c
+<span class="c"># DB 서브넷: /24 × 3</span>
+10.10.52.0/24   db-a
+10.10.53.0/24   db-b
+10.10.54.0/24   db-c
+<span class="c"># 10.10.64.0/18 이후는 미래 확장용으로 비워둠 (중요!)</span></pre>
+<div class="box tip"><b class="t">💡 서브넷 경계 빠르게 계산하기</b>/20의 블록 크기는 3번째 옥텟 기준 2<sup>(24−20)</sup> = 16입니다. 그래서 0, 16, 32, 48 …에서 시작합니다. /22면 4씩(0, 4, 8, …), /26이면 4번째 옥텟 기준 64씩(0, 64, 128, 192)입니다. 시작 주소가 블록 크기의 배수가 아니면 잘못된 CIDR입니다(예: <code>10.0.5.0/22</code>는 무효, <code>10.0.4.0/22</code>가 맞음).</div>
+
+<h2>2.3 라우팅의 원리</h2>
+<p>라우터(그리고 AWS 라우트 테이블)는 패킷의 <strong>목적지 IP</strong>를 보고 다음 홉(next hop)을 결정합니다. 여러 경로가 일치하면 <strong>가장 긴 접두사 일치(Longest Prefix Match)</strong> 규칙에 따라 더 구체적인 경로가 이깁니다.</p>
+<pre>라우트 테이블:
+  10.0.0.0/16     → local
+  10.1.0.0/16     → pcx-1234 (VPC Peering)
+  10.1.5.0/24     → tgw-abcd (Transit Gateway)
+  0.0.0.0/0       → igw-9999
+
+목적지 10.1.5.7  → 10.1.0.0/16 과 10.1.5.0/24 둘 다 일치 → /24가 더 길므로 TGW로
+목적지 8.8.8.8   → 0.0.0.0/0 만 일치 → 인터넷 게이트웨이로
+목적지 10.0.3.4  → local (VPC 내부 통신)</pre>
+<p><code>0.0.0.0/0</code>은 "모든 주소"를 뜻하는 <strong>기본 경로(default route)</strong>입니다. 프리픽스 길이가 0이라 항상 가장 마지막 순위입니다.</p>
+
+<h2>2.4 NAT (Network Address Translation)</h2>
+<p>사설 IP는 인터넷에서 라우팅되지 않으므로, 사설 IP를 가진 서버가 인터넷에 나가려면 공인 IP로 바꿔주는 장치가 필요합니다.</p>
+<ul>
+<li><strong>SNAT / PAT</strong>: 여러 사설 IP를 하나의 공인 IP로 변환(포트로 구분). AWS의 <strong>NAT Gateway</strong>가 이 역할 → 프라이빗 서브넷의 아웃바운드 인터넷 접근.</li>
+<li><strong>1:1 NAT</strong>: 사설 IP 하나와 공인 IP 하나를 고정 매핑. AWS의 <strong>인터넷 게이트웨이(IGW)</strong>가 퍼블릭 IP/EIP를 가진 인스턴스에 대해 이 역할을 수행합니다. 인스턴스 OS 안에서는 공인 IP가 보이지 않고 사설 IP만 보이는 이유가 이것입니다.</li>
+</ul>
+
+<h2>2.5 TCP와 UDP</h2>
+<table>
+<tr><th>구분</th><th>TCP</th><th>UDP</th></tr>
+<tr><td>연결</td><td>연결 지향(3-way handshake)</td><td>비연결</td></tr>
+<tr><td>신뢰성</td><td>순서 보장, 재전송, 흐름 제어</td><td>보장 없음, 빠름</td></tr>
+<tr><td>예시</td><td>HTTP/1.1·2, SSH, DB 연결</td><td>DNS 질의, VoIP, 게임, QUIC(HTTP/3)</td></tr>
+<tr><td>AWS LB</td><td>ALB(HTTP), NLB(TCP/TLS)</td><td>NLB(UDP)</td></tr>
+</table>
+<pre>3-way handshake          클라이언트:52344 ─────────▶ 서버:443
+  1) SYN        ─▶          (출발지 포트는 임시 포트, 목적지 포트는 서비스 포트)
+  2) SYN-ACK    ◀─        서버:443  ─────────▶ 클라이언트:52344
+  3) ACK        ─▶          (응답은 반대 방향, 목적지가 임시 포트!)</pre>
+<div class="box warn"><b class="t">⚠ 임시 포트(Ephemeral Port)와 NACL [SAA][ANS]</b>클라이언트는 출발지 포트로 임시 포트(Linux 32768–60999, Windows 49152–65535, NAT GW/ELB는 1024–65535)를 씁니다. 서버의 응답은 이 임시 포트로 돌아가므로, <strong>상태 비저장(stateless)인 NACL</strong>은 아웃바운드에 <code>1024-65535</code> 범위를 허용해야 응답이 나갈 수 있습니다. 보안 그룹은 상태 저장(stateful)이라 신경 쓸 필요가 없습니다.</div>
+
+<h2>2.6 DNS</h2>
+<p>DNS는 도메인 이름을 IP 주소로 변환합니다. 브라우저에서 <code>www.example.com</code>을 입력하면:</p>
+<ol>
+<li>OS/브라우저 캐시 확인 → 없으면 <strong>재귀 리졸버</strong>(VPC에서는 Route 53 Resolver, VPC CIDR+2 주소)에 질의</li>
+<li>리졸버가 루트 서버 → <code>.com</code> TLD 서버 → <code>example.com</code>의 <strong>권한 있는(authoritative) 네임서버</strong>(예: Route 53 호스팅 영역) 순서로 질의</li>
+<li>응답을 TTL 동안 캐시</li>
+</ol>
+<table>
+<tr><th>레코드</th><th>의미</th></tr>
+<tr><td>A / AAAA</td><td>이름 → IPv4 / IPv6</td></tr>
+<tr><td>CNAME</td><td>이름 → 다른 이름 (Zone Apex, 즉 example.com 자체에는 사용 불가)</td></tr>
+<tr><td>Alias (Route 53 전용)</td><td>이름 → AWS 리소스(ELB, CloudFront, S3 웹사이트 등). Zone Apex 가능, 조회 무료</td></tr>
+<tr><td>MX / TXT / NS / SOA</td><td>메일 서버 / 텍스트(SPF·도메인 검증) / 네임서버 / 영역 정보</td></tr>
+<tr><td>SRV / CAA / PTR</td><td>서비스 위치 / 인증서 발급 허용 CA / 역방향 조회</td></tr>
+</table>
+
+<h2>2.7 HTTP와 TLS</h2>
+<p>HTTPS = HTTP + TLS. TLS는 서버 인증서로 서버 신원을 검증하고, 세션 키를 교환해 트래픽을 암호화합니다. AWS에서는 <strong>ACM</strong>(무료 공인 인증서)을 ALB·CloudFront·API Gateway에 붙여 TLS를 종료하는 것이 일반적입니다. <strong>SNI(Server Name Indication)</strong> 덕분에 하나의 ALB 리스너에 여러 도메인의 인증서를 붙일 수 있습니다.</p>
+<table>
+<tr><th>상태 코드</th><th>의미</th><th>AWS에서 흔한 원인</th></tr>
+<tr><td>301/302</td><td>리다이렉트</td><td>ALB HTTP→HTTPS 리다이렉트 규칙</td></tr>
+<tr><td>403</td><td>권한 없음</td><td>S3 버킷 정책, WAF 차단, CloudFront OAC 설정 오류</td></tr>
+<tr><td>502</td><td>Bad Gateway</td><td>대상이 비정상 응답/연결 끊김, Lambda 응답 형식 오류</td></tr>
+<tr><td>503</td><td>Service Unavailable</td><td>ALB 대상 그룹에 정상(healthy) 대상이 없음</td></tr>
+<tr><td>504</td><td>Gateway Timeout</td><td>대상이 유휴 제한 시간(기본 60초) 내에 응답 안 함, SG가 LB→대상 차단</td></tr>
+</table>
+
+<div class="box quiz"><b class="t">📝 확인 문제 2</b>
+1) <code>172.20.0.0/22</code>에는 몇 개의 IP가 있고, AWS 서브넷으로 만들면 몇 개를 쓸 수 있나요?<br>
+2) <code>10.0.8.0/21</code>은 올바른 CIDR인가요? <code>10.0.12.0/21</code>은?<br>
+3) 라우트 테이블에 <code>10.0.0.0/8 → tgw</code>, <code>10.20.0.0/16 → pcx</code>가 있을 때 <code>10.20.3.3</code>은 어디로 가나요?<br>
+4) NACL 인바운드에 443만 허용하고 아웃바운드에 443만 허용했습니다. 외부 사용자의 HTTPS 접속은 될까요?</div>

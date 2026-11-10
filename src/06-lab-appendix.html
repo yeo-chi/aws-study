@@ -1,0 +1,278 @@
+
+<h1 class="chapter"><span class="no">CHAPTER 16</span>실습: 3-Tier 웹 아키텍처 구축</h1>
+<div class="goal"><b>학습 목표</b> · 지금까지 배운 리소스를 직접 엮어 동작하는 서비스를 만든다 · 패킷이 어떤 리소스를 거치는지 한 홉씩 설명한다 · 실습 후 모든 리소스를 정리한다</div>
+
+<h2>16.1 목표 아키텍처</h2>
+<pre>사용자 ──HTTPS──▶ Route 53 (app.example.com, Alias)
+                    │
+                    ▼
+               CloudFront (+ WAF)        ← 선택 사항
+                    │
+                    ▼
+     ALB (퍼블릭 서브넷 a/c, sg-alb: 443 from 0.0.0.0/0)
+                    │  HTTP 8080
+                    ▼
+     ASG: EC2 (프라이빗 앱 서브넷 a/c, sg-app: 8080 from sg-alb)
+        │ 아웃바운드 업데이트 → NAT GW(같은 AZ) → IGW
+        │ S3 접근 → 게이트웨이 엔드포인트
+        │ 3306
+        ▼
+     RDS MySQL Multi-AZ (프라이빗 DB 서브넷 a/c, sg-db: 3306 from sg-app)
+운영 접속: SSM Session Manager (SSH 포트 없음, 배스천 없음)</pre>
+
+<h2>16.2 단계별 CLI 실습</h2>
+<p>아래 명령은 흐름 이해를 위한 것입니다. 반복 실습은 14장의 Terraform 코드로 하는 것을 권장합니다. ID 값은 앞 단계 출력에서 받아 변수에 저장합니다.</p>
+<h3>1단계: VPC와 서브넷</h3>
+<pre>export AWS_DEFAULT_REGION=ap-northeast-2
+VPC=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=lab-vpc}]' \
+  --query Vpc.VpcId --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC --enable-dns-hostnames
+mk() { aws ec2 create-subnet --vpc-id $VPC --cidr-block $1 --availability-zone $2 \
+       --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$3}]" \
+       --query Subnet.SubnetId --output text; }
+PUB_A=$(mk 10.0.1.0/24  ap-northeast-2a pub-a);  PUB_C=$(mk 10.0.2.0/24  ap-northeast-2c pub-c)
+APP_A=$(mk 10.0.11.0/24 ap-northeast-2a app-a);  APP_C=$(mk 10.0.12.0/24 ap-northeast-2c app-c)
+DB_A=$(mk 10.0.21.0/24  ap-northeast-2a db-a);   DB_C=$(mk 10.0.22.0/24  ap-northeast-2c db-c)</pre>
+<h3>2단계: 인터넷 게이트웨이와 퍼블릭 라우팅</h3>
+<pre>IGW=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC
+RT_PUB=$(aws ec2 create-route-table --vpc-id $VPC --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $RT_PUB --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW
+aws ec2 associate-route-table --route-table-id $RT_PUB --subnet-id $PUB_A
+aws ec2 associate-route-table --route-table-id $RT_PUB --subnet-id $PUB_C</pre>
+<h3>3단계: NAT Gateway와 프라이빗 라우팅 (AZ별)</h3>
+<pre>for AZ in A C; do
+  PUB=$(eval echo \$PUB_$AZ); APP=$(eval echo \$APP_$AZ)
+  EIP=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+  NAT=$(aws ec2 create-nat-gateway --subnet-id $PUB --allocation-id $EIP \
+        --query NatGateway.NatGatewayId --output text)
+  aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT
+  RT=$(aws ec2 create-route-table --vpc-id $VPC --query RouteTable.RouteTableId --output text)
+  aws ec2 create-route --route-table-id $RT --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT
+  aws ec2 associate-route-table --route-table-id $RT --subnet-id $APP
+done
+<span class="c"># DB 서브넷은 별도 라우트 테이블(기본 경로 없음) = 격리 서브넷</span></pre>
+<h3>4단계: 보안 그룹 체이닝</h3>
+<pre>sg() { aws ec2 create-security-group --group-name $1 --description $1 --vpc-id $VPC \
+       --query GroupId --output text; }
+SG_ALB=$(sg lab-alb); SG_APP=$(sg lab-app); SG_DB=$(sg lab-db)
+aws ec2 authorize-security-group-ingress --group-id $SG_ALB --protocol tcp --port 80  --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id $SG_ALB --protocol tcp --port 443 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id $SG_APP --protocol tcp --port 8080 --source-group $SG_ALB
+aws ec2 authorize-security-group-ingress --group-id $SG_DB  --protocol tcp --port 3306 --source-group $SG_APP</pre>
+<h3>5단계: 앱 서버 (Launch Template + ASG)</h3>
+<pre><span class="c"># 사전 준비: AmazonSSMManagedInstanceCore 정책이 붙은 역할 + 인스턴스 프로파일 "lab-ec2"</span>
+AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+      --query Parameter.Value --output text)
+cat > userdata.sh <<'EOF'
+#!/bin/bash
+dnf -y install python3
+mkdir -p /srv && cd /srv
+echo "ok from $(hostname)" > health
+echo "hello from $(hostname)" > index.html
+nohup python3 -m http.server 8080 &
+EOF
+aws ec2 create-launch-template --launch-template-name lab-lt --launch-template-data "{
+  \"ImageId\":\"$AMI\",\"InstanceType\":\"t4g.micro\",
+  \"IamInstanceProfile\":{\"Name\":\"lab-ec2\"},
+  \"SecurityGroupIds\":[\"$SG_APP\"],
+  \"MetadataOptions\":{\"HttpTokens\":\"required\"},
+  \"UserData\":\"$(base64 -w0 userdata.sh)\"}"</pre>
+<h3>6단계: ALB와 대상 그룹</h3>
+<pre>TG=$(aws elbv2 create-target-group --name lab-tg --protocol HTTP --port 8080 --vpc-id $VPC \
+     --health-check-path /health --query 'TargetGroups[0].TargetGroupArn' --output text)
+ALB=$(aws elbv2 create-load-balancer --name lab-alb --subnets $PUB_A $PUB_C \
+      --security-groups $SG_ALB --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+aws elbv2 create-listener --load-balancer-arn $ALB --protocol HTTP --port 80 \
+  --default-actions Type=forward,TargetGroupArn=$TG
+<span class="c"># (도메인이 있다면) ACM 인증서 발급 후 443 리스너 추가, 80은 리다이렉트로 변경</span>
+aws autoscaling create-auto-scaling-group --auto-scaling-group-name lab-asg \
+  --launch-template LaunchTemplateName=lab-lt --min-size 2 --max-size 4 --desired-capacity 2 \
+  --vpc-zone-identifier "$APP_A,$APP_C" --target-group-arns $TG \
+  --health-check-type ELB --health-check-grace-period 120
+aws autoscaling put-scaling-policy --auto-scaling-group-name lab-asg --policy-name cpu50 \
+  --policy-type TargetTrackingScaling --target-tracking-configuration \
+  '{"PredefinedMetricSpecification":{"PredefinedMetricType":"ASGAverageCPUUtilization"},"TargetValue":50}'</pre>
+<h3>7단계: 확인</h3>
+<pre>DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB --query 'LoadBalancers[0].DNSName' --output text)
+for i in 1 2 3 4; do curl -s http://$DNS/; done        <span class="c"># 두 호스트 이름이 번갈아 나오면 성공</span>
+aws elbv2 describe-target-health --target-group-arn $TG  <span class="c"># healthy 확인</span></pre>
+<p>RDS(8단계)는 <code>aws rds create-db-subnet-group</code>(DB_A, DB_C) → <code>aws rds create-db-instance --multi-az --no-publicly-accessible --vpc-security-group-ids $SG_DB --manage-master-user-password</code>(비밀번호를 Secrets Manager가 관리) 순으로 생성합니다.</p>
+
+<h2>16.3 패킷 흐름 따라가기 (면접 단골 질문)</h2>
+<div class="box note"><b class="t">ℹ 사용자 요청 한 건이 거치는 경로</b>
+① 브라우저가 <code>app.example.com</code> 조회 → Route 53이 ALB의 IP들 반환(Alias)<br>
+② 클라이언트 → ALB 퍼블릭 IP:80. 인터넷에서 <strong>IGW</strong>가 목적지 공인 IP를 ALB 노드 ENI의 사설 IP로 변환<br>
+③ <strong>퍼블릭 서브넷 NACL</strong> 인바운드 평가 → <strong>sg-alb</strong> 인바운드 443/80 허용<br>
+④ ALB가 대상 선택(헬스 체크 정상인 인스턴스). 새 TCP 연결: 출발지 = ALB 노드 사설 IP, 목적지 = 10.0.11.x:8080<br>
+⑤ VPC 라우트 테이블 <code>local</code> 경로 → 앱 서브넷 NACL 인바운드 → <strong>sg-app</strong>(소스 sg-alb, 8080 허용)<br>
+⑥ 앱이 DB 조회: 10.0.11.x → 10.0.21.y:3306, <code>local</code> 경로, <strong>sg-db</strong>(소스 sg-app) 허용<br>
+⑦ 응답은 역순. SG는 상태 저장이라 자동 허용, NACL은 임시 포트 아웃바운드 규칙 필요<br>
+⑧ 앱 서버가 OS 업데이트 시: 0.0.0.0/0 → <strong>같은 AZ NAT GW</strong>(사설 IP를 EIP로 SNAT) → IGW → 인터넷</div>
+
+<h2>16.4 일부러 망가뜨려 보기 (트러블슈팅 훈련)</h2>
+<table>
+<tr><th style="width:40%">이렇게 바꿔보세요</th><th>예상 증상 / 확인할 것</th></tr>
+<tr><td>sg-app의 소스를 sg-alb → 다른 SG로 변경</td><td>대상 unhealthy → ALB 503, Flow Logs에 REJECT</td></tr>
+<tr><td>앱 서브넷 NACL에 아웃바운드 1024-65535 거부</td><td>헬스 체크 실패(응답이 못 나감)</td></tr>
+<tr><td>app-a 라우트 테이블에서 NAT 경로 삭제</td><td>app-a 인스턴스만 <code>dnf update</code> 타임아웃, SSM 접속도 실패(엔드포인트가 없다면)</td></tr>
+<tr><td>헬스 체크 경로를 /nope으로</td><td>모든 대상 unhealthy (404) → 503</td></tr>
+<tr><td>인스턴스 하나에서 웹 서버 프로세스 종료</td><td>ELB 헬스 체크 유형이면 ASG가 자동 교체</td></tr>
+</table>
+<p><strong>Reachability Analyzer</strong>로 "ALB ENI → 인스턴스 ENI:8080" 경로를 분석해 어느 구성 요소가 막는지 확인해 보세요.</p>
+
+<h2>16.5 정리 (반드시!)</h2>
+<pre>aws autoscaling delete-auto-scaling-group --auto-scaling-group-name lab-asg --force-delete
+aws elbv2 delete-load-balancer --load-balancer-arn $ALB
+aws elbv2 delete-target-group --target-group-arn $TG   <span class="c"># LB 삭제 후 잠시 뒤</span>
+aws ec2 delete-launch-template --launch-template-name lab-lt
+<span class="c"># NAT GW 삭제 → 삭제 완료 대기 → EIP 해제 (해제 안 하면 계속 과금)</span>
+<span class="c"># RDS 삭제(--skip-final-snapshot 또는 최종 스냅샷), SG, 서브넷, 라우트 테이블, IGW 분리/삭제, VPC 삭제</span>
+<span class="c"># 마지막으로 Cost Explorer / Tag Editor에서 Project=study 리소스가 남았는지 확인</span></pre>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 17</span>트러블슈팅 가이드</h1>
+<div class="goal"><b>학습 목표</b> · "연결이 안 된다"를 계층적으로 좁혀 원인을 찾는다 · 증상별 1순위 의심 항목을 안다</div>
+
+<h2>17.1 연결 문제 진단 순서 (바깥에서 안으로, 아래에서 위로)</h2>
+<ol>
+<li><strong>DNS</strong>: 이름이 올바른 IP로 풀리나? <code>dig app.example.com</code>, 프라이빗 호스팅 영역이 VPC에 연결되었나?</li>
+<li><strong>라우팅</strong>: 출발지 서브넷 라우트 테이블에 목적지 경로가 있나? 돌아오는 경로도 있나(비대칭 라우팅)? Peering/TGW는 <strong>양쪽 모두</strong> 경로 필요.</li>
+<li><strong>NACL</strong>: 양쪽 서브넷, 양방향(임시 포트 포함) 허용인가?</li>
+<li><strong>보안 그룹</strong>: 목적지 인바운드 허용? 출발지 아웃바운드 허용(기본 전체 허용을 지웠다면)?</li>
+<li><strong>대상 OS</strong>: 프로세스가 <code>0.0.0.0</code>에서 리슨 중인가(127.0.0.1만 리슨하면 외부 불가)? OS 방화벽(firewalld/iptables)?</li>
+<li><strong>애플리케이션</strong>: 로그, 헬스 체크 응답 코드.</li>
+</ol>
+<pre><span class="c"># 인스턴스 안에서 쓰는 기본 도구</span>
+ss -tlnp                       <span class="c"># 어떤 포트를 어디서 리슨하는지</span>
+curl -v telnet://10.0.21.8:3306   <span class="c"># TCP 연결 테스트 (또는 nc -zv host port)</span>
+dig +short myservice.internal  <span class="c"># DNS 해석</span>
+traceroute -T -p 443 example.com
+<span class="c"># "Connection refused" = 패킷은 도달했으나 리슨하는 프로세스가 없음 (네트워크는 OK)</span>
+<span class="c"># "Timeout"           = 중간에서 버려짐 → SG/NACL/라우팅/NAT를 의심</span></pre>
+
+<h2>17.2 증상별 체크리스트</h2>
+<table>
+<tr><th style="width:32%">증상</th><th>1순위 의심</th></tr>
+<tr><td>EC2에 SSH/RDP 타임아웃</td><td>퍼블릭 IP 없음, 서브넷에 IGW 경로 없음, SG에 내 IP 미허용, NACL. → 가능하면 Session Manager 사용</td></tr>
+<tr><td>프라이빗 EC2가 인터넷 불가</td><td>라우트 테이블의 NAT 경로, NAT GW가 <strong>퍼블릭</strong> 서브넷에 있는지, NAT 서브넷의 IGW 경로</td></tr>
+<tr><td>ALB 503</td><td>대상 그룹에 healthy 대상 없음 → 헬스 체크 경로/포트/SG</td></tr>
+<tr><td>ALB 504</td><td>대상 응답 지연(유휴 타임아웃), 대상 SG가 ALB 차단, 앱 무응답</td></tr>
+<tr><td>ALB 502</td><td>대상이 연결을 끊음(keep-alive 타임아웃이 ALB보다 짧음), 잘못된 응답, TLS 불일치</td></tr>
+<tr><td>S3 403 AccessDenied</td><td>IAM 정책, 버킷 정책 Deny(VPCE/IP 조건), KMS 키 정책 권한 누락, 퍼블릭 액세스 차단, 객체 소유권</td></tr>
+<tr><td>인터페이스 엔드포인트 타임아웃</td><td>엔드포인트 SG 443 인바운드, 프라이빗 DNS 활성화, VPC DNS 속성 두 개</td></tr>
+<tr><td>피어링 후 통신 불가</td><td>양쪽 라우트 테이블, SG에 상대 CIDR/SG, 전이 라우팅 시도 여부</td></tr>
+<tr><td>VPN 터널 UP인데 통신 불가</td><td>라우트 전파/정적 경로, 온프레미스 방화벽, 암호화 도메인(정책 기반 VPN) 불일치</td></tr>
+<tr><td>RDS 연결 불가</td><td>SG 3306/5432, 클라이언트가 VPC 내부인지, 엔드포인트 이름 사용 여부(IP 하드코딩 금지)</td></tr>
+<tr><td>Lambda가 VPC 연결 후 외부 API 실패</td><td>Lambda가 프라이빗 서브넷 + NAT 경로가 있는지</td></tr>
+<tr><td>갑자기 "권한 없음"</td><td>CloudTrail에서 errorCode 확인, SCP 변경, 권한 경계, 세션 만료</td></tr>
+<tr><td>요청이 스로틀링(429/ThrottlingException)</td><td>API 한도, Service Quotas, 지수 백오프 재시도</td></tr>
+</table>
+<div class="box tip"><b class="t">💡 진단 도구 모음</b>VPC Reachability Analyzer(경로 분석) · VPC Flow Logs(ACCEPT/REJECT) · CloudTrail(누가 바꿨나) · Config 타임라인(언제부터 바뀌었나) · ELB Access Logs · CloudWatch 지표(<code>HealthyHostCount</code>, <code>TargetResponseTime</code>, <code>HTTPCode_ELB_5XX_Count</code>) · IAM Policy Simulator · <code>aws sts get-caller-identity</code></div>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">APPENDIX</span>부록</h1>
+
+<h2>A. 핵심 용어집</h2>
+<table>
+<tr><th style="width:22%">용어</th><th>뜻</th></tr>
+<tr><td>AZ</td><td>가용 영역. 리전 안의 독립된 데이터센터 묶음</td></tr>
+<tr><td>CIDR</td><td>IP 대역 표기법(예: 10.0.0.0/16)</td></tr>
+<tr><td>ENI</td><td>가상 네트워크 인터페이스</td></tr>
+<tr><td>EIP</td><td>고정 공인 IPv4 주소</td></tr>
+<tr><td>IGW</td><td>VPC와 인터넷을 연결하는 게이트웨이</td></tr>
+<tr><td>NAT GW</td><td>프라이빗 서브넷의 아웃바운드 인터넷 접근용 관리형 NAT</td></tr>
+<tr><td>SG / NACL</td><td>ENI 단위 상태 저장 방화벽 / 서브넷 단위 상태 비저장 방화벽</td></tr>
+<tr><td>VGW / CGW</td><td>AWS 측 VPN 게이트웨이 / 고객 측 게이트웨이 정보</td></tr>
+<tr><td>TGW</td><td>여러 VPC·온프레미스를 잇는 허브 라우터</td></tr>
+<tr><td>DX / VIF</td><td>Direct Connect 전용선 / 그 위의 가상 인터페이스(VLAN+BGP)</td></tr>
+<tr><td>BGP / ASN</td><td>동적 라우팅 프로토콜 / 자율 시스템 번호</td></tr>
+<tr><td>PrivateLink</td><td>인터페이스 엔드포인트로 서비스를 사설 연결하는 기술</td></tr>
+<tr><td>ARN</td><td>AWS 리소스 고유 식별자</td></tr>
+<tr><td>STS</td><td>임시 자격 증명 발급 서비스</td></tr>
+<tr><td>SCP</td><td>Organizations에서 계정 최대 권한을 제한하는 정책</td></tr>
+<tr><td>RTO / RPO</td><td>복구 목표 시간 / 복구 목표 시점(데이터 손실 허용)</td></tr>
+<tr><td>IaC</td><td>코드로 인프라를 정의·배포</td></tr>
+<tr><td>IMDS</td><td>인스턴스 메타데이터 서비스(169.254.169.254)</td></tr>
+<tr><td>OAC</td><td>CloudFront만 S3 오리진에 접근하게 하는 설정</td></tr>
+<tr><td>Hyperplane</td><td>NAT GW, NLB, PrivateLink, Lambda VPC ENI 등의 기반인 AWS 내부 분산 네트워크 기능</td></tr>
+</table>
+
+<h2>B. 자주 쓰는 포트 번호</h2>
+<table>
+<tr><th>포트</th><th>프로토콜</th><th>포트</th><th>프로토콜</th></tr>
+<tr><td>22</td><td>SSH / SFTP</td><td>3306</td><td>MySQL / MariaDB / Aurora MySQL</td></tr>
+<tr><td>25 / 587 / 465</td><td>SMTP (EC2 25번은 기본 제한)</td><td>5432</td><td>PostgreSQL</td></tr>
+<tr><td>53</td><td>DNS (UDP/TCP)</td><td>1433</td><td>SQL Server</td></tr>
+<tr><td>80 / 443</td><td>HTTP / HTTPS</td><td>1521</td><td>Oracle</td></tr>
+<tr><td>123</td><td>NTP (AWS: 169.254.169.123)</td><td>6379</td><td>Redis / Valkey</td></tr>
+<tr><td>179</td><td>BGP</td><td>11211</td><td>Memcached</td></tr>
+<tr><td>389 / 636</td><td>LDAP / LDAPS</td><td>27017</td><td>MongoDB / DocumentDB</td></tr>
+<tr><td>500 / 4500 (UDP)</td><td>IPsec IKE / NAT-T</td><td>2049</td><td>NFS (EFS)</td></tr>
+<tr><td>3389</td><td>RDP</td><td>445</td><td>SMB (FSx Windows)</td></tr>
+<tr><td>6081 (UDP)</td><td>GENEVE (GWLB)</td><td>9092</td><td>Kafka</td></tr>
+</table>
+
+<h2>C. CIDR 빠른 참조표</h2>
+<table>
+<tr><th>프리픽스</th><th>마스크</th><th>주소 수</th><th>프리픽스</th><th>마스크</th><th>주소 수</th></tr>
+<tr><td>/16</td><td>255.255.0.0</td><td>65,536</td><td>/24</td><td>255.255.255.0</td><td>256</td></tr>
+<tr><td>/17</td><td>255.255.128.0</td><td>32,768</td><td>/25</td><td>255.255.255.128</td><td>128</td></tr>
+<tr><td>/18</td><td>255.255.192.0</td><td>16,384</td><td>/26</td><td>255.255.255.192</td><td>64</td></tr>
+<tr><td>/19</td><td>255.255.224.0</td><td>8,192</td><td>/27</td><td>255.255.255.224</td><td>32</td></tr>
+<tr><td>/20</td><td>255.255.240.0</td><td>4,096</td><td>/28</td><td>255.255.255.240</td><td>16</td></tr>
+<tr><td>/21</td><td>255.255.248.0</td><td>2,048</td><td>/29</td><td>255.255.255.248</td><td>8</td></tr>
+<tr><td>/22</td><td>255.255.252.0</td><td>1,024</td><td>/30</td><td>255.255.255.252</td><td>4</td></tr>
+<tr><td>/23</td><td>255.255.254.0</td><td>512</td><td>/32</td><td>255.255.255.255</td><td>1</td></tr>
+</table>
+
+<h2>D. 주요 기본 한도 (변경 가능, Service Quotas에서 확인)</h2>
+<table>
+<tr><th>항목</th><th>기본값</th></tr>
+<tr><td>리전당 VPC</td><td>5</td></tr>
+<tr><td>VPC당 서브넷</td><td>200</td></tr>
+<tr><td>VPC당 IPv4 CIDR 블록</td><td>5</td></tr>
+<tr><td>리전당 Elastic IP</td><td>5</td></tr>
+<tr><td>ENI당 보안 그룹</td><td>5 (최대 16)</td></tr>
+<tr><td>보안 그룹당 인바운드/아웃바운드 규칙</td><td>각 60</td></tr>
+<tr><td>NACL당 규칙</td><td>방향별 20 (최대 40)</td></tr>
+<tr><td>라우트 테이블당 경로</td><td>50 (최대 1,000)</td></tr>
+<tr><td>VPC당 활성 피어링</td><td>50 (최대 125)</td></tr>
+<tr><td>VGW BGP 광고 수신 경로</td><td>100</td></tr>
+</table>
+
+<h2>E. 학습 로드맵과 자격증</h2>
+<table>
+<tr><th style="width:30%">단계</th><th>자격증 / 활동</th></tr>
+<tr><td>입문</td><td>AWS Certified Cloud Practitioner (CLF-C02) — 개념 위주</td></tr>
+<tr><td>핵심 (이 교재 범위)</td><td><strong>Solutions Architect – Associate (SAA-C03)</strong> — 인프라 엔지니어 필수</td></tr>
+<tr><td>운영/자동화</td><td>CloudOps Engineer – Associate(구 SysOps), DevOps Engineer – Professional</td></tr>
+<tr><td>네트워크 전문</td><td><strong>Advanced Networking – Specialty (ANS-C01)</strong> — 5장 심화 + BGP/DX/하이브리드 DNS</td></tr>
+<tr><td>설계 전문</td><td>Solutions Architect – Professional (SAP-C02)</td></tr>
+<tr><td>보안</td><td>Security – Specialty (SCS-C03)</td></tr>
+</table>
+<p><strong>추천 학습 자료</strong>: AWS 공식 문서(특히 VPC User Guide, "How Amazon VPC works"), AWS Skill Builder(무료 강의·실습), AWS Well-Architected 문서, AWS re:Invent 네트워크 세션(NET3xx/4xx — "Advanced VPC design" 류), AWS Workshops(workshops.aws).</p>
+<p><strong>학습 팁</strong>: ① 그림을 손으로 그리기 ② 콘솔 → CLI → IaC 순서로 같은 것을 세 번 만들기 ③ 일부러 망가뜨리고 고치기 ④ Flow Logs와 CloudTrail을 직접 읽어보기 ⑤ 매주 What's New(aws.amazon.com/new) 훑어보기.</p>
+
+<h2>F. 확인 문제 정답</h2>
+<h4>1장</h4>
+<p>1) 최소 2개 AZ에 분산 배치(ELB + ASG 등). 2) EC2 위 MySQL은 고객, RDS는 AWS가 엔진 패치(적용 시점·유지 관리 기간 설정은 고객). 3) AZ 이름이 아닌 AZ ID(apne2-az1 등).</p>
+<h4>2장</h4>
+<p>1) 1,024개, 사용 가능 1,019개. 2) 10.0.8.0/21은 올바름(8의 배수), 10.0.12.0/21은 무효(/21의 시작은 0, 8, 16…). 3) 더 긴 /16이 이기므로 pcx(피어링). 4) 안 됨. 응답은 클라이언트의 임시 포트로 나가야 하므로 아웃바운드 1024-65535 허용 필요.</p>
+<h4>3장</h4>
+<p>1) 불가 — 명시적 Deny 우선. 2) (a) Lambda 실행 역할에 s3:GetObject 허용 + 계정 B 버킷 정책에서 계정 A의 역할 허용, (b) 계정 B에 읽기 역할을 만들고 Lambda가 AssumeRole. (KMS 암호화면 키 정책도) 3) 불가 — SCP는 권한을 주지 않으며 Allow가 별도로 필요.</p>
+<h4>4장</h4>
+<p>1) 안 됨 — 퍼블릭 IP/EIP 필요. 2) AZ-a 장애 시 모든 프라이빗 서브넷의 아웃바운드가 끊기고, 다른 AZ에서 AZ 간 전송 요금 발생 → AZ별 NAT GW(또는 리전 NAT GW). 3) NACL — SG는 거부 규칙이 없음. 4) 앱 서버의 보안 그룹 ID.</p>
+<h4>5장</h4>
+<p>1) A–C를 직접 피어링하거나 Transit Gateway 사용(피어링은 전이 불가). 2) S3 게이트웨이 엔드포인트(무료) 추가. 3) Route 53 Resolver 인바운드 엔드포인트 + 온프레미스 DNS에 조건부 전달 설정(+ VPN/DX 연결). 4) Direct Connect.</p>
+<h4>6장</h4>
+<p>1) 스팟 인스턴스(여러 인스턴스 유형, 체크포인트). 2) 스냅샷 생성 → AZ-c에서 볼륨 복원 → 연결. 3) ASG 헬스 체크 유형이 ELB인지, 대상 그룹 헬스 체크 설정. 4) Lambda를 프라이빗 서브넷에 두고 NAT GW 경로 설정(퍼블릭 서브넷에 둬도 퍼블릭 IP를 받지 못함).</p>
+<h4>8장</h4>
+<p>1) 0~30일 Standard → 30일 Standard-IA(또는 Glacier IR) → 365일 Glacier Flexible/Deep Archive → 7년(2,555일) 후 만료 삭제. 2) EFS. 3) CloudFront + OAC + ACM 인증서, 버킷은 퍼블릭 액세스 차단 유지.</p>
+<h4>9장</h4>
+<p>1) 아니요 — Multi-AZ 스탠바이는 읽기 불가(인스턴스 배포 기준). 읽기 전용 복제본 또는 Aurora 리더로 분리. 2) Aurora Global Database(또는 DynamoDB Global Tables). 3) RDS Proxy.</p>
+
+<div class="box note" style="margin-top:8mm"><b class="t">마치며</b>AWS 네트워크를 잘 아는 엔지니어와 그렇지 않은 엔지니어의 차이는 결국 <strong>"패킷 하나가 어디를 거쳐 어떻게 돌아오는지 설명할 수 있는가"</strong>입니다. 16장의 패킷 흐름을 보지 않고 설명할 수 있을 때까지 반복해 보세요. 서비스의 세부 수치(한도, 가격, 성능)는 자주 바뀌므로, 원리를 이해하고 숫자는 공식 문서에서 확인하는 습관을 들이세요.</div>
+</body>
+</html>

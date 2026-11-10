@@ -1,0 +1,184 @@
+
+<h1 class="chapter"><span class="no">CHAPTER 5</span>VPC 심화 &amp; 하이브리드 네트워크</h1>
+<div class="goal"><b>학습 목표</b> · 게이트웨이/인터페이스 엔드포인트와 PrivateLink를 구분한다 · Peering과 Transit Gateway의 차이와 선택 기준을 안다 · Site-to-Site VPN과 Direct Connect의 구성 요소(VGW, CGW, VIF, BGP)를 설명한다 · 하이브리드 DNS와 Flow Logs, IPv6 설계를 이해한다</div>
+
+<h2>5.1 VPC 엔드포인트</h2>
+<p>프라이빗 서브넷에서 S3, DynamoDB, SQS 같은 AWS 서비스를 쓸 때, 인터넷(NAT)을 거치지 않고 <strong>AWS 내부 네트워크로 직접</strong> 접근하게 해줍니다. 보안(인터넷 노출 없음)과 비용(NAT 처리 요금 절감) 두 가지 이점이 있습니다.</p>
+<table>
+<tr><th style="width:18%">구분</th><th>게이트웨이 엔드포인트</th><th>인터페이스 엔드포인트 (PrivateLink)</th></tr>
+<tr><td>지원 서비스</td><td><strong>S3, DynamoDB</strong> 두 개뿐</td><td>대부분의 AWS 서비스 + 서드파티/자체 서비스 (S3도 지원)</td></tr>
+<tr><td>동작 방식</td><td>라우트 테이블에 프리픽스 리스트(pl-xxx) 경로 추가</td><td>서브넷에 ENI(사설 IP) 생성, DNS로 해당 IP로 연결</td></tr>
+<tr><td>비용</td><td><strong>무료</strong></td><td>AZ당 시간 요금 + GB당 요금</td></tr>
+<tr><td>온프레미스/피어링에서 접근</td><td>불가(라우팅 기반이라 VPC 내부 전용)</td><td>가능(VPN/DX/TGW로 ENI IP에 도달)</td></tr>
+<tr><td>보안 제어</td><td>엔드포인트 정책</td><td>엔드포인트 정책 + 보안 그룹</td></tr>
+</table>
+<pre><span class="c">// S3 버킷 정책: 특정 VPC 엔드포인트를 통한 접근만 허용</span>
+{
+  "Effect": "Deny", "Principal": "*", "Action": "s3:*",
+  "Resource": ["arn:aws:s3:::secure-bucket", "arn:aws:s3:::secure-bucket/*"],
+  "Condition": { "StringNotEquals": { "aws:SourceVpce": "vpce-0a1b2c3d" } }
+}</pre>
+<div class="box warn"><b class="t">⚠ 엔드포인트 사용 시 흔한 실수</b>
+• 게이트웨이 엔드포인트는 <strong>같은 리전</strong>의 S3에만 적용됩니다. 다른 리전 버킷은 여전히 NAT를 탑니다.<br>
+• 인터페이스 엔드포인트의 보안 그룹에서 <strong>클라이언트 → 443 인바운드</strong>를 허용하지 않아 타임아웃 나는 경우가 매우 흔합니다.<br>
+• 완전 격리 서브넷에서 SSM Session Manager를 쓰려면 <code>ssm</code>, <code>ssmmessages</code>, (필요 시 <code>ec2messages</code>) 인터페이스 엔드포인트가 필요합니다. ECR에서 이미지를 받으려면 <code>ecr.api</code>, <code>ecr.dkr</code> + S3 게이트웨이 엔드포인트가 필요합니다.</div>
+
+<h3>PrivateLink로 내 서비스 공개하기</h3>
+<p>서비스 제공자는 <strong>NLB(또는 GWLB)</strong> 앞에 <strong>엔드포인트 서비스</strong>를 만들고, 소비자는 자기 VPC에 인터페이스 엔드포인트를 만듭니다. 트래픽은 단방향(소비자 → 제공자)이고, <strong>양쪽 CIDR이 겹쳐도</strong> 동작하며, VPC 전체를 연결하지 않고 특정 서비스만 노출한다는 점이 Peering과의 큰 차이입니다. SaaS 제공, 멀티 계정 공용 서비스에 많이 씁니다. 최근에는 <strong>VPC Lattice</strong>(서비스 간 L7 연결·인증 관리형 서비스)와 <strong>리소스 엔드포인트</strong>(RDS 등 특정 리소스를 NLB 없이 공유)도 선택지입니다.</p>
+
+<h2>5.2 VPC Peering</h2>
+<ul>
+<li>두 VPC를 1:1로 연결. 같은/다른 계정, 같은/다른 리전 모두 가능. AWS 백본 사용, 대역폭 제한·단일 장애점 없음.</li>
+<li><strong>전이적 라우팅 불가(Non-transitive)</strong>: A–B, B–C가 피어링되어 있어도 A는 C와 통신할 수 없습니다. B의 IGW/NAT/VPN을 빌려 쓰는 것(edge-to-edge)도 불가.</li>
+<li><strong>CIDR이 겹치면 생성 불가.</strong></li>
+<li>양쪽 라우트 테이블에 상대 CIDR → <code>pcx-xxx</code> 경로를 직접 추가해야 하고, 보안 그룹도 허용해야 합니다(같은 리전이면 상대 VPC의 SG ID 참조 가능).</li>
+<li>VPC가 많아지면 연결 수가 n(n−1)/2로 폭증 → 10개 VPC면 45개. 이때 Transit Gateway를 씁니다.</li>
+</ul>
+
+<h2>5.3 Transit Gateway (TGW)</h2>
+<div class="fig">
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK KR" font-size="12">
+  <circle cx="360" cy="130" r="55" fill="#8c4fff"/><text x="327" y="126" fill="#fff" font-weight="700">Transit</text><text x="324" y="144" fill="#fff" font-weight="700">Gateway</text>
+  <g fill="#eef4ff" stroke="#1f6feb">
+    <rect x="40" y="20" width="140" height="44" rx="6"/><rect x="40" y="108" width="140" height="44" rx="6"/><rect x="40" y="196" width="140" height="44" rx="6"/>
+  </g>
+  <text x="55" y="47">VPC Prod 10.1/16</text><text x="55" y="135">VPC Dev 10.2/16</text><text x="55" y="223">VPC Shared 10.3/16</text>
+  <g fill="#fff4e5" stroke="#d97706">
+    <rect x="540" y="20" width="160" height="44" rx="6"/><rect x="540" y="108" width="160" height="44" rx="6"/><rect x="540" y="196" width="160" height="44" rx="6"/>
+  </g>
+  <text x="552" y="47">Site-to-Site VPN</text><text x="552" y="135">Direct Connect GW</text><text x="552" y="223">TGW Peering(타 리전)</text>
+  <g stroke="#555" stroke-width="2">
+    <line x1="180" y1="42" x2="312" y2="105"/><line x1="180" y1="130" x2="305" y2="130"/><line x1="180" y1="218" x2="312" y2="155"/>
+    <line x1="540" y1="42" x2="408" y2="105"/><line x1="540" y1="130" x2="415" y2="130"/><line x1="540" y1="218" x2="408" y2="155"/>
+  </g>
+</svg>
+<div class="cap">그림 5-1. 허브 앤 스포크: 모든 네트워크가 TGW 하나에 연결(Attachment)된다</div>
+</div>
+<table>
+<tr><th style="width:24%">개념</th><th>설명</th></tr>
+<tr><td>Attachment</td><td>TGW에 붙는 연결: VPC, VPN, Direct Connect Gateway, TGW Peering, Connect(GRE/BGP, SD-WAN 연동)</td></tr>
+<tr><td>TGW 라우트 테이블</td><td>TGW 내부의 라우팅 도메인. 여러 개 만들어 <strong>세그먼트 분리</strong>(예: Prod와 Dev는 서로 못 가고, 둘 다 Shared는 갈 수 있게)</td></tr>
+<tr><td>Association</td><td>Attachment가 "어느 라우트 테이블을 보고 나갈지" 결정 (Attachment당 1개)</td></tr>
+<tr><td>Propagation</td><td>Attachment의 CIDR을 어떤 라우트 테이블에 자동으로 전파(학습)할지 (여러 개 가능)</td></tr>
+<tr><td>VPC Attachment 서브넷</td><td>AZ마다 하나의 서브넷 지정(관례적으로 전용 /28). 지정한 AZ에서만 트래픽 처리 가능</td></tr>
+<tr><td>Appliance Mode</td><td>검사용 VPC(방화벽)에서 대칭 라우팅 보장 — 같은 흐름이 같은 AZ 방화벽을 지나게 함</td></tr>
+<tr><td>성능</td><td>VPC attachment당 AZ별 최대 100 Gbps 버스트, VPN 터널당 1.25 Gbps(ECMP로 묶어 확장)</td></tr>
+</table>
+<div class="box tip"><b class="t">💡 세그멘테이션 예시</b>
+RT-Prod: Prod VPC Attachment를 연결(Associate). 전파: Shared, 온프레미스(VPN/DX)<br>
+RT-Dev: Dev VPC Attachment 연결. 전파: Shared<br>
+RT-Shared: Shared VPC·VPN Attachment 연결. 전파: Prod, Dev, 온프레미스<br>
+→ Prod ↔ Dev는 서로의 경로가 없으므로 통신 불가. 블랙홀 경로(<code>blackhole</code>)로 명시적 차단도 가능.<br>
+VPC 쪽 라우트 테이블에도 <code>10.0.0.0/8 → tgw-xxx</code> 같은 경로를 넣어야 한다는 점을 잊지 마세요.</div>
+<p>대규모 글로벌 네트워크는 <strong>AWS Cloud WAN</strong>(정책 기반으로 여러 리전의 TGW·세그먼트를 중앙 관리)을 고려합니다.</p>
+
+<h2>5.4 Site-to-Site VPN</h2>
+<table>
+<tr><th style="width:24%">구성 요소</th><th>설명</th></tr>
+<tr><td>CGW (Customer Gateway)</td><td>온프레미스 VPN 장비의 정보(공인 IP, BGP ASN)를 AWS에 등록한 리소스</td></tr>
+<tr><td>VGW (Virtual Private Gateway)</td><td>VPC 하나에 붙는 AWS 측 VPN 종단점 (또는 TGW에 VPN을 붙임)</td></tr>
+<tr><td>VPN 연결</td><td><strong>터널 2개</strong>(서로 다른 AWS 엔드포인트, 고가용성), IPsec(IKEv1/v2)</td></tr>
+<tr><td>라우팅</td><td>정적 라우팅 또는 <strong>BGP(동적, 권장)</strong> — BGP는 장애 시 자동 경로 전환</td></tr>
+<tr><td>대역폭</td><td>터널당 최대 1.25 Gbps (Large 터널 옵션 시 5 Gbps). TGW + ECMP로 여러 터널 합산</td></tr>
+<tr><td>Accelerated VPN</td><td>Global Accelerator 엣지를 통해 진입 → 원거리 지사 성능 개선 (TGW에서만)</td></tr>
+</table>
+<ul>
+<li>VPC 라우트 테이블에서 <strong>라우트 전파(Route Propagation)</strong>를 켜면 VGW가 학습한 온프레미스 경로가 자동으로 들어옵니다.</li>
+<li>온프레미스 방화벽에서 UDP 500(IKE), UDP 4500(NAT-T), ESP(프로토콜 50)를 허용해야 합니다.</li>
+<li>터널이 유휴 상태면 내려갈 수 있으므로 DPD 설정 또는 지속적인 핑으로 유지합니다.</li>
+<li><strong>Client VPN</strong>: 개별 사용자 PC(OpenVPN 기반)가 VPC에 접속하는 관리형 원격 접속 VPN. 사이트 간 VPN과 구분하세요.</li>
+</ul>
+
+<h2>5.5 Direct Connect (DX)</h2>
+<p>온프레미스와 AWS를 <strong>전용 물리 회선</strong>으로 연결합니다. 인터넷을 거치지 않아 대역폭·지연이 일정하고, AWS에서 나가는 데이터 전송 비용이 인터넷보다 저렴합니다. 회선 개통에는 수 주가 걸릴 수 있습니다.</p>
+<div class="fig">
+<svg viewBox="0 0 720 170" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK KR" font-size="11.5">
+  <rect x="10" y="40" width="140" height="90" rx="8" fill="#fff4e5" stroke="#d97706"/><text x="35" y="65" font-weight="700">온프레미스</text><text x="25" y="90">고객 라우터</text><text x="25" y="110">(BGP ASN 65000)</text>
+  <line x1="150" y1="85" x2="230" y2="85" stroke="#333" stroke-width="3"/><text x="160" y="77" font-size="10">통신사 회선</text>
+  <rect x="230" y="30" width="170" height="110" rx="8" fill="#f5f3ff" stroke="#7c3aed"/><text x="245" y="55" font-weight="700">DX 로케이션</text><text x="245" y="80">(예: KINX, LG U+ 등)</text><text x="245" y="105">Cross Connect</text><text x="245" y="125">→ AWS DX 라우터</text>
+  <line x1="400" y1="85" x2="470" y2="85" stroke="#333" stroke-width="3"/>
+  <rect x="470" y="10" width="240" height="45" rx="6" fill="#eef4ff" stroke="#1f6feb"/><text x="480" y="38">Private VIF → VGW / DX GW → VPC</text>
+  <rect x="470" y="62" width="240" height="45" rx="6" fill="#e9f6ec" stroke="#2e8b57"/><text x="480" y="90">Public VIF → S3 등 AWS 퍼블릭 엔드포인트</text>
+  <rect x="470" y="114" width="240" height="45" rx="6" fill="#fde8f4" stroke="#be185d"/><text x="480" y="142">Transit VIF → DX GW → TGW</text>
+</svg>
+<div class="cap">그림 5-2. Direct Connect 구성과 가상 인터페이스(VIF) 3종</div>
+</div>
+<table>
+<tr><th style="width:24%">개념</th><th>설명</th></tr>
+<tr><td>Dedicated Connection</td><td>AWS와 직접 계약하는 물리 포트: 1, 10, 100, 400 Gbps</td></tr>
+<tr><td>Hosted Connection</td><td>파트너가 나눠 제공: 50 Mbps ~ 25 Gbps</td></tr>
+<tr><td>VIF (Virtual Interface)</td><td>802.1Q VLAN + BGP 세션. Private / Public / Transit 3종</td></tr>
+<tr><td>Direct Connect Gateway</td><td>글로벌 리소스. 하나의 DX로 <strong>여러 리전의 VPC(VGW) 또는 TGW</strong>에 연결</td></tr>
+<tr><td>LAG</td><td>같은 속도의 여러 연결을 묶음(LACP)</td></tr>
+<tr><td>암호화</td><td>DX는 기본 암호화가 아님 → <strong>MACsec</strong>(10/100/400G 전용 연결) 또는 DX 위에 IPsec VPN</td></tr>
+</table>
+<h3>DX 고가용성 설계 [ANS]</h3>
+<ul>
+<li><strong>최대 복원력</strong>: 2개 DX 로케이션 × 각 2개 연결(장비 분리).</li>
+<li><strong>높은 복원력</strong>: 2개 DX 로케이션 × 각 1개 연결.</li>
+<li><strong>비용 효율적 백업</strong>: DX 1개 + Site-to-Site VPN 백업. AWS는 같은 프리픽스라면 <strong>DX 경로를 VPN보다 우선</strong>합니다.</li>
+</ul>
+<h3>BGP 경로 선택 제어</h3>
+<table>
+<tr><th>목적</th><th>방법</th></tr>
+<tr><td>AWS → 온프레미스 방향 선택(인바운드 제어)</td><td>더 구체적인 프리픽스 광고, <strong>AS_PATH Prepend</strong>(경로를 길게 보여 덜 선호되게)</td></tr>
+<tr><td>온프레미스 → AWS 방향 선택(아웃바운드 제어)</td><td>고객 라우터에서 <strong>Local Preference</strong> 조정</td></tr>
+<tr><td>AWS 측 지역 선호도</td><td>BGP Community 태그(7224:7100 낮음 ~ 7224:7300 높음)</td></tr>
+</table>
+<p>AWS의 경로 우선순위(VPC 라우트 테이블): <strong>가장 긴 프리픽스</strong> → 정적 경로 → 전파된 경로 중 DX BGP → 정적 VPN → BGP VPN 순.</p>
+
+<h2>5.6 하이브리드 DNS: Route 53 Resolver</h2>
+<table>
+<tr><th style="width:26%">구성</th><th>방향</th><th>용도</th></tr>
+<tr><td>인바운드 엔드포인트</td><td>온프레미스 → AWS</td><td>온프레미스 DNS 서버가 AWS 프라이빗 호스팅 영역 이름을 조회 (조건부 포워딩 대상으로 엔드포인트 IP 지정)</td></tr>
+<tr><td>아웃바운드 엔드포인트 + 전달 규칙</td><td>AWS → 온프레미스</td><td><code>corp.example.local</code> 같은 사내 도메인 조회를 온프레미스 DNS로 전달</td></tr>
+<tr><td>Resolver DNS Firewall</td><td>VPC 내부</td><td>악성 도메인 차단, DNS 기반 데이터 유출 방지</td></tr>
+</table>
+<p>전달 규칙은 <strong>RAM(Resource Access Manager)</strong>으로 여러 계정에 공유할 수 있어, 중앙 네트워크 계정에서 한 번만 구성하면 됩니다.</p>
+
+<h2>5.7 VPC Flow Logs</h2>
+<p>ENI 단위로 오가는 IP 트래픽의 메타데이터(패킷 내용 아님)를 CloudWatch Logs, S3, Firehose로 기록합니다. VPC/서브넷/ENI 수준에서 켤 수 있습니다.</p>
+<pre><span class="c"># 기본 형식 (version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status)</span>
+2 123456789012 eni-0a1b 10.0.11.25 10.0.21.8 49152 3306 6 10 840 1700000000 1700000060 ACCEPT OK
+2 123456789012 eni-0a1b 203.0.113.9 10.0.1.10 51515 22 6 1 40 1700000000 1700000060 REJECT OK</pre>
+<ul>
+<li><code>REJECT</code>는 SG 또는 NACL이 막았다는 뜻. 인바운드는 ACCEPT인데 응답이 REJECT면 → <strong>NACL 아웃바운드(임시 포트)</strong>를 의심.</li>
+<li>기록되지 않는 트래픽: Amazon DNS 질의, 메타데이터(169.254.169.254), DHCP, Windows 라이선스 활성화, 기본 VPC 라우터 예약 IP 트래픽 등.</li>
+<li>사용자 지정 형식으로 <code>pkt-srcaddr</code>, <code>tcp-flags</code>, <code>flow-direction</code>, <code>traffic-path</code> 등 추가 가능 → NAT 뒤 실제 출발지 파악에 유용.</li>
+<li>분석은 CloudWatch Logs Insights 또는 S3 + Athena.</li>
+</ul>
+<p>패킷 내용까지 봐야 한다면 <strong>Traffic Mirroring</strong>(ENI 트래픽을 IDS/분석 장비로 복사)을 사용합니다. 경로 문제를 정적으로 분석하려면 <strong>Reachability Analyzer</strong>(A→B 도달 가능 여부와 막는 지점 표시), 의도치 않은 외부 노출은 <strong>Network Access Analyzer</strong>를 씁니다.</p>
+
+<h2>5.8 IPv6 in VPC</h2>
+<ul>
+<li>VPC에 Amazon 제공 <strong>/56</strong> 또는 BYOIP/IPAM의 IPv6 CIDR 할당, 서브넷은 <strong>/64</strong>.</li>
+<li>IPv6 주소는 모두 <strong>글로벌 유니캐스트(공인)</strong>입니다. NAT가 없으므로, 아웃바운드만 허용하려면 <strong>Egress-only Internet Gateway</strong>를 사용(IPv6용 NAT GW 역할).</li>
+<li>IPv6 전용 서브넷 + <strong>DNS64/NAT64</strong>(NAT GW가 지원)로 IPv4 전용 서비스와 통신 가능.</li>
+<li>퍼블릭 IPv4 과금 이후 IPv6 도입이 비용 절감 수단으로 주목받고 있습니다. ALB/NLB는 듀얼 스택 지원.</li>
+</ul>
+
+<h2>5.9 기타 네트워크 서비스</h2>
+<table>
+<tr><th style="width:26%">서비스</th><th>설명</th></tr>
+<tr><td>AWS Network Firewall</td><td>관리형 상태 저장 방화벽(Suricata 규칙 호환). 도메인 필터링, IPS. 중앙 검사 VPC + TGW 구조로 많이 배포</td></tr>
+<tr><td>Gateway Load Balancer</td><td>서드파티 방화벽 어플라이언스(Palo Alto, Fortinet 등)를 투명하게 끼워 넣음(GENEVE, 포트 6081)</td></tr>
+<tr><td>RAM</td><td>서브넷, TGW, Resolver 규칙, 프리픽스 리스트 등을 다른 계정과 공유 → <strong>VPC 공유</strong>(공유 서브넷)로 중앙에서 네트워크 관리</td></tr>
+<tr><td>Managed Prefix List</td><td>CIDR 묶음을 이름으로 관리해 SG·라우트에서 재사용</td></tr>
+<tr><td>Elastic Fabric Adapter / 배치 그룹</td><td>HPC용 초저지연 네트워크(6장 참고)</td></tr>
+</table>
+
+<h3>연결 방식 선택 가이드</h3>
+<table>
+<tr><th>상황</th><th>추천</th></tr>
+<tr><td>VPC 2~3개, 단순 연결</td><td>VPC Peering</td></tr>
+<tr><td>VPC 수십 개 + 온프레미스, 세그먼트 분리</td><td>Transit Gateway (+ 멀티 리전이면 TGW Peering 또는 Cloud WAN)</td></tr>
+<tr><td>특정 서비스만 노출, CIDR 겹침, SaaS 제공</td><td>PrivateLink / VPC Lattice</td></tr>
+<tr><td>온프레미스 연결, 빠른 구축·저비용</td><td>Site-to-Site VPN</td></tr>
+<tr><td>대용량·안정적 대역폭·저지연 하이브리드</td><td>Direct Connect (+ VPN 백업)</td></tr>
+</table>
+
+<div class="box quiz"><b class="t">📝 확인 문제 5</b>
+1) VPC A–B, B–C가 피어링되어 있습니다. A에서 C로 통신하려면 어떻게 해야 하나요?<br>
+2) 프라이빗 서브넷 EC2가 S3에서 매일 5 TB를 읽어 NAT 비용이 큽니다. 가장 간단한 해결책은?<br>
+3) 온프레미스 서버가 AWS 프라이빗 호스팅 영역 <code>db.internal.example</code>을 조회해야 합니다. 무엇이 필요한가요?<br>
+4) DX와 VPN이 같은 프리픽스를 광고합니다. AWS는 어느 쪽을 선호하나요?</div>

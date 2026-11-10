@@ -1,0 +1,337 @@
+
+<h1 class="chapter"><span class="no">CHAPTER 10</span>DNS와 콘텐츠 전송</h1>
+<div class="goal"><b>학습 목표</b> · Route 53 라우팅 정책 7가지와 헬스 체크를 활용한다 · CloudFront의 캐시 동작과 오리진 보호를 설정한다 · CloudFront와 Global Accelerator를 구분한다</div>
+
+<h2>10.1 Route 53</h2>
+<p>고가용성 DNS 서비스(SLA 100%), 도메인 등록, 헬스 체크를 제공합니다.</p>
+<ul>
+<li><strong>퍼블릭 호스팅 영역</strong>: 인터넷에서 조회. <strong>프라이빗 호스팅 영역</strong>: 연결된 VPC 안에서만 조회(Split-horizon DNS 가능).</li>
+<li>도메인을 다른 등록 기관에서 샀다면, 그곳의 NS 레코드를 Route 53 호스팅 영역의 4개 네임서버로 바꿔야 합니다.</li>
+<li><strong>TTL</strong>: 변경 전에 미리 TTL을 낮춰 두면 전환이 빨라집니다. Alias 레코드는 대상 리소스의 TTL을 따릅니다.</li>
+</ul>
+<h3>라우팅 정책 [SAA 빈출]</h3>
+<table>
+<tr><th style="width:22%">정책</th><th>동작</th><th style="width:30%">용도</th></tr>
+<tr><td>단순(Simple)</td><td>하나의 레코드(여러 IP면 무작위 순서). 헬스 체크 불가</td><td>단일 리소스</td></tr>
+<tr><td>가중치(Weighted)</td><td>비율로 분배(예: 90:10)</td><td>카나리 배포, 블루/그린</td></tr>
+<tr><td>지연 시간(Latency)</td><td>사용자에게 지연이 가장 낮은 AWS 리전</td><td>멀티 리전 성능</td></tr>
+<tr><td>장애 조치(Failover)</td><td>Primary 비정상 시 Secondary</td><td>액티브-패시브 DR</td></tr>
+<tr><td>지리적 위치(Geolocation)</td><td>사용자 위치(국가·대륙) 기준</td><td>현지화, 콘텐츠 라이선스 제한</td></tr>
+<tr><td>지리 근접성(Geoproximity)</td><td>거리 + 바이어스로 영역 크기 조정(Traffic Flow)</td><td>점진적 트래픽 이동</td></tr>
+<tr><td>IP 기반</td><td>클라이언트 CIDR 기준</td><td>ISP별 최적 엔드포인트</td></tr>
+<tr><td>다중 값 응답</td><td>정상 레코드 최대 8개 반환</td><td>간단한 클라이언트 측 분산(LB 대체 아님)</td></tr>
+</table>
+<p><strong>헬스 체크</strong>: 엔드포인트(HTTP/HTTPS/TCP), 다른 헬스 체크 조합(계산된), CloudWatch 경보 기반. 헬스 체커는 인터넷에서 접근하므로 프라이빗 리소스는 CloudWatch 경보 방식을 사용합니다. 방화벽에서 Route 53 헬스 체커 IP 대역을 허용해야 합니다.</p>
+
+<h2>10.2 CloudFront</h2>
+<p>전 세계 수백 개 엣지 로케이션에서 콘텐츠를 캐시하는 CDN입니다. 정적 파일뿐 아니라 동적 콘텐츠(API)도 AWS 백본을 통한 최적 경로·TLS 종료·연결 재사용으로 빨라집니다.</p>
+<table>
+<tr><th style="width:26%">개념</th><th>설명</th></tr>
+<tr><td>오리진</td><td>S3, ALB, EC2, API Gateway, 임의 HTTP 서버, 그리고 VPC 오리진(프라이빗 서브넷의 ALB/NLB/EC2를 퍼블릭 노출 없이)</td></tr>
+<tr><td>캐시 동작(Behavior)</td><td>경로 패턴별 오리진·캐시 정책 지정 (<code>/api/*</code>는 캐시 안 함, <code>/static/*</code>는 1일 캐시)</td></tr>
+<tr><td>캐시 정책 / 오리진 요청 정책</td><td>캐시 키(헤더·쿠키·쿼리) vs 오리진으로 전달할 값 분리. 캐시 키가 많을수록 적중률↓</td></tr>
+<tr><td>OAC</td><td>S3 오리진을 CloudFront만 접근 가능하게(버킷 정책에서 CloudFront 서비스 주체 + 배포 ARN 조건)</td></tr>
+<tr><td>ALB 오리진 보호</td><td>ALB SG에 CloudFront 관리형 프리픽스 리스트만 허용 + 커스텀 헤더 검증, 또는 VPC 오리진</td></tr>
+<tr><td>무효화(Invalidation)</td><td>캐시 강제 삭제(비용 발생) → 파일명 버전 관리(<code>app.3f2a.js</code>)가 더 좋음</td></tr>
+<tr><td>서명된 URL/쿠키</td><td>유료 콘텐츠 접근 제한</td></tr>
+<tr><td>엣지 컴퓨팅</td><td>CloudFront Functions(경량 JS, 헤더 조작·리다이렉트), Lambda@Edge(무거운 로직)</td></tr>
+<tr><td>보안</td><td>WAF 연결, Shield Standard 기본, 지리적 제한, TLS 인증서는 <strong>us-east-1의 ACM</strong>에서 발급</td></tr>
+</table>
+
+<h2>10.3 Global Accelerator</h2>
+<p>2개의 <strong>고정 애니캐스트 IP</strong>를 제공하고, 사용자를 가장 가까운 엣지에서 AWS 백본으로 태워 리전의 엔드포인트(ALB, NLB, EC2, EIP)로 보냅니다.</p>
+<table>
+<tr><th>비교</th><th>CloudFront</th><th>Global Accelerator</th></tr>
+<tr><td>캐시</td><td>있음</td><td>없음(프록시)</td></tr>
+<tr><td>프로토콜</td><td>HTTP/HTTPS/WebSocket</td><td>TCP/UDP 전반</td></tr>
+<tr><td>IP</td><td>변동</td><td>고정 애니캐스트 IP 2개</td></tr>
+<tr><td>장애 조치</td><td>오리진 그룹 장애 조치</td><td>리전 간 수십 초 내 장애 조치(DNS 캐시 영향 없음)</td></tr>
+<tr><td>용도</td><td>웹 콘텐츠·API 가속</td><td>게임, IoT, VoIP, 고정 IP 화이트리스트 필요 시</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 11</span>보안 서비스</h1>
+<div class="goal"><b>학습 목표</b> · 데이터 보호(KMS, Secrets Manager, ACM)를 설정한다 · 경계 보호(WAF, Shield, Network Firewall)를 구분한다 · 위협 탐지·컴플라이언스 서비스의 역할을 안다</div>
+
+<h2>11.1 데이터 보호</h2>
+<table>
+<tr><th style="width:24%">서비스</th><th>설명</th></tr>
+<tr><td>KMS</td><td>암호화 키 관리. AWS 관리형 키 / <strong>고객 관리형 키(CMK)</strong>(키 정책·교체·감사 제어). <strong>봉투 암호화</strong>: 데이터는 데이터 키로, 데이터 키는 KMS 키로 암호화. 키 정책이 1차 권한 원천. 멀티 리전 키 지원</td></tr>
+<tr><td>CloudHSM</td><td>전용 HSM(FIPS 140-3 Level 3), 키를 고객이 단독 통제</td></tr>
+<tr><td>Secrets Manager</td><td>DB 비밀번호·API 키 저장, <strong>자동 교체</strong>(RDS 연동), 크로스 계정 공유</td></tr>
+<tr><td>SSM Parameter Store</td><td>설정값·비밀(SecureString) 저장. 표준 계층 무료, 자동 교체 없음</td></tr>
+<tr><td>ACM</td><td>무료 공인 TLS 인증서 자동 갱신(ELB, CloudFront, API Gateway). EC2에 직접 설치는 불가(내보내기 가능한 인증서 옵션은 유료). 사설 CA도 제공</td></tr>
+<tr><td>Macie</td><td>S3의 개인정보(PII) 자동 탐지</td></tr>
+</table>
+<div class="box note"><b class="t">ℹ 전송 중 / 저장 중 암호화</b>저장 중(at rest): EBS·S3·RDS·DynamoDB 모두 KMS로 간단히 활성화. 전송 중(in transit): TLS 사용, S3 버킷 정책으로 HTTPS 강제, RDS는 <code>require_secure_transport</code>/<code>rds.force_ssl</code>, 같은 VPC 내 최신 Nitro 인스턴스 간 트래픽은 하드웨어 수준에서 자동 암호화.</div>
+
+<h2>11.2 경계(네트워크/애플리케이션) 보호</h2>
+<table>
+<tr><th style="width:24%">서비스</th><th>설명</th></tr>
+<tr><td>AWS WAF</td><td>L7 방화벽. CloudFront, ALB, API Gateway, AppSync, Cognito에 연결. SQLi/XSS 관리형 규칙, 속도 기반 규칙(IP당 요청 제한), 지역 차단, Bot Control</td></tr>
+<tr><td>Shield Standard</td><td>모든 고객 무료, L3/L4 DDoS 방어</td></tr>
+<tr><td>Shield Advanced</td><td>유료(월 정액). L7 DDoS 대응, 24/7 SRT 지원, DDoS로 인한 확장 비용 보호</td></tr>
+<tr><td>Network Firewall</td><td>VPC 수준 상태 저장 방화벽/IPS, 도메인 필터링(5장)</td></tr>
+<tr><td>Firewall Manager</td><td>Organizations 전체에 WAF·SG·Network Firewall 정책 일괄 적용</td></tr>
+<tr><td>Verified Access</td><td>VPN 없이 사내 앱에 제로 트러스트 접근</td></tr>
+</table>
+
+<h2>11.3 탐지와 대응</h2>
+<table>
+<tr><th style="width:24%">서비스</th><th>설명</th></tr>
+<tr><td>GuardDuty</td><td>CloudTrail, VPC Flow Logs, DNS 로그 등을 ML로 분석해 위협 탐지(채굴, 자격 증명 탈취, 이상 API 호출). 에이전트 불필요, 켜기만 하면 됨</td></tr>
+<tr><td>Inspector</td><td>EC2·ECR 이미지·Lambda의 취약점(CVE)과 네트워크 노출 스캔</td></tr>
+<tr><td>Security Hub</td><td>보안 결과 통합 대시보드, CIS/AWS 모범 사례 표준 점검</td></tr>
+<tr><td>Detective</td><td>보안 사건의 근본 원인 조사(그래프 분석)</td></tr>
+<tr><td>Config</td><td>리소스 구성 변경 이력과 규칙 준수 평가(12장)</td></tr>
+<tr><td>Audit Manager / Artifact</td><td>감사 증적 수집 / AWS 컴플라이언스 보고서(SOC, ISO) 다운로드</td></tr>
+</table>
+<div class="box tip"><b class="t">💡 신규 계정 보안 기본 세트</b>루트 MFA → CloudTrail(조직 트레일) → GuardDuty → Security Hub → Config → IAM Access Analyzer → S3 퍼블릭 액세스 차단(계정 수준) → EBS 기본 암호화 → IMDSv2 기본값 → 예산 알림. Control Tower를 쓰면 상당 부분이 자동 구성됩니다.</div>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 12</span>모니터링·감사·운영</h1>
+<div class="goal"><b>학습 목표</b> · CloudWatch 지표·로그·경보를 구성한다 · CloudTrail과 Config의 차이를 안다 · Systems Manager로 SSH 없이 서버를 관리한다</div>
+
+<h2>12.1 CloudWatch</h2>
+<table>
+<tr><th style="width:24%">기능</th><th>설명</th></tr>
+<tr><td>Metrics</td><td>EC2 기본 지표 5분(세부 모니터링 1분). <strong>메모리·디스크 사용률은 기본 지표에 없음</strong> → CloudWatch Agent 설치 필요. 사용자 지정 지표(고해상도 1초)</td></tr>
+<tr><td>Alarms</td><td>지표 임계값 → SNS 알림, Auto Scaling, EC2 작업(재부팅/복구). 복합 경보로 노이즈 감소. 이상 탐지 밴드</td></tr>
+<tr><td>Logs</td><td>로그 그룹/스트림, 보존 기간 설정(기본 무기한 → 비용 주의), Logs Insights 쿼리, 지표 필터, 구독 필터(→ Lambda/Firehose)</td></tr>
+<tr><td>Dashboards</td><td>교차 계정·교차 리전 대시보드</td></tr>
+<tr><td>Synthetics / RUM</td><td>카나리 스크립트로 외부 모니터링 / 실사용자 모니터링</td></tr>
+<tr><td>Application Signals / X-Ray</td><td>APM, 분산 추적(서비스 맵, 지연 구간 분석). OpenTelemetry 기반 수집 권장</td></tr>
+<tr><td>Container Insights</td><td>ECS/EKS 지표·로그</td></tr>
+</table>
+<pre><span class="c"># Logs Insights: 최근 1시간 5xx가 많은 경로 Top 10 (ALB 로그를 CloudWatch로 수집한 경우 예시)</span>
+fields @timestamp, request_url, elb_status_code
+| filter elb_status_code >= 500
+| stats count(*) as errors by request_url
+| sort errors desc
+| limit 10</pre>
+
+<h2>12.2 CloudTrail vs Config</h2>
+<table>
+<tr><th style="width:18%">구분</th><th>CloudTrail</th><th>Config</th></tr>
+<tr><td>질문</td><td><strong>"누가, 언제, 어떤 API를 호출했나?"</strong></td><td><strong>"리소스 구성이 어떻게 바뀌었고, 규칙을 준수하나?"</strong></td></tr>
+<tr><td>데이터</td><td>API 호출 이벤트(관리 이벤트 기본, 데이터 이벤트는 별도 설정·과금)</td><td>리소스 구성 스냅샷·변경 타임라인</td></tr>
+<tr><td>기본 보존</td><td>이벤트 기록 90일(콘솔) → 장기 보존은 트레일로 S3에</td><td>설정한 기간</td></tr>
+<tr><td>예시</td><td>SG 규칙을 삭제한 사용자 찾기</td><td>"SSH 0.0.0.0/0 허용 SG가 있나" 규칙 → 자동 수정(SSM 문서)</td></tr>
+</table>
+<p>조직 단위 <strong>Organization Trail</strong>을 만들고, 로그는 별도 Log Archive 계정의 S3(Object Lock, 로그 파일 무결성 검증)에 보관하는 것이 표준입니다. CloudTrail Lake로 SQL 쿼리도 가능합니다.</p>
+
+<h2>12.3 Systems Manager (SSM)</h2>
+<table>
+<tr><th style="width:24%">기능</th><th>설명</th></tr>
+<tr><td>Session Manager</td><td><strong>SSH 포트·배스천·키 없이</strong> 브라우저/CLI로 쉘 접속. IAM으로 권한 제어, 세션 로그를 S3/CloudWatch에 기록. 포트 포워딩으로 프라이빗 RDS 접근도 가능</td></tr>
+<tr><td>Run Command</td><td>여러 서버에 명령 일괄 실행</td></tr>
+<tr><td>Patch Manager</td><td>패치 기준선·유지 관리 기간으로 자동 패치</td></tr>
+<tr><td>Parameter Store</td><td>설정·비밀 저장</td></tr>
+<tr><td>Automation</td><td>런북 자동화(AMI 생성, 장애 복구 절차)</td></tr>
+<tr><td>Inventory / Fleet Manager</td><td>설치 소프트웨어 목록, 서버 원격 관리</td></tr>
+</table>
+<pre><span class="c"># 인스턴스 접속 (SSM Agent + 역할 AmazonSSMManagedInstanceCore 필요)</span>
+aws ssm start-session --target i-0123456789abcdef0
+<span class="c"># 로컬 5432 → 프라이빗 RDS 5432 포트 포워딩</span>
+aws ssm start-session --target i-0123456789abcdef0 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters host=mydb.xxxx.ap-northeast-2.rds.amazonaws.com,portNumber=5432,localPortNumber=5432</pre>
+<p>그 밖에 <strong>Trusted Advisor</strong>(비용·보안·한도 점검), <strong>Health Dashboard</strong>(내 계정에 영향 있는 AWS 장애·예정 작업), <strong>Service Quotas</strong>(한도 조회·증가 요청), <strong>Compute Optimizer</strong>(Right-sizing 추천)를 정기적으로 확인하세요.</p>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 13</span>애플리케이션 통합</h1>
+<div class="goal"><b>학습 목표</b> · 동기 결합을 비동기 메시징으로 풀어 장애 전파를 막는다 · SQS / SNS / EventBridge / Kinesis의 차이를 안다</div>
+<table>
+<tr><th style="width:18%">서비스</th><th>모델</th><th>특징</th></tr>
+<tr><td>SQS</td><td>큐(Pull)</td><td>Standard(거의 무제한 처리량, 최소 1회 전달, 순서 비보장) / FIFO(순서·정확히 1회 처리). 가시성 제한 시간, DLQ, 롱 폴링, 메시지 최대 1 MiB(그 이상은 S3 + 확장 클라이언트). ASG를 큐 길이로 확장</td></tr>
+<tr><td>SNS</td><td>Pub/Sub(Push)</td><td>하나의 메시지를 여러 구독자(SQS, Lambda, HTTP, 이메일, SMS)에게 <strong>팬아웃</strong>. 메시지 필터링</td></tr>
+<tr><td>EventBridge</td><td>이벤트 버스</td><td>이벤트 패턴 기반 라우팅, AWS 서비스·SaaS 이벤트, 스케줄러, 아카이브/재생, 크로스 계정</td></tr>
+<tr><td>Kinesis Data Streams</td><td>스트리밍</td><td>샤드 기반 실시간 스트림, 순서 보장(샤드 내), 재처리(보존 최대 365일). 대안: MSK(Kafka)</td></tr>
+<tr><td>Data Firehose</td><td>전송</td><td>스트림을 S3/Redshift/OpenSearch로 거의 실시간 적재(버퍼링, 변환)</td></tr>
+<tr><td>Step Functions</td><td>워크플로</td><td>상태 머신으로 여러 단계 오케스트레이션, 재시도·보상 트랜잭션</td></tr>
+<tr><td>API Gateway</td><td>API 프런트</td><td>REST/HTTP/WebSocket API, 인증(Cognito/JWT/IAM/Lambda), 스로틀링, 사용량 계획. 엔드포인트 유형: 엣지 최적화·리전·<strong>프라이빗</strong>(VPC 엔드포인트로만 접근)</td></tr>
+</table>
+<div class="box tip"><b class="t">💡 SNS + SQS 팬아웃 패턴</b>주문 이벤트 → SNS 토픽 → (결제 큐, 배송 큐, 분석 큐) 각각 SQS 구독. 소비자가 독립적으로 장애·확장되고, 실패 메시지는 각 큐의 DLQ로 격리됩니다.</div>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 14</span>Infrastructure as Code</h1>
+<div class="goal"><b>학습 목표</b> · 콘솔 클릭 대신 코드로 인프라를 만들고 지운다 · CloudFormation, CDK, Terraform의 차이를 안다 · 상태 관리와 드리프트를 이해한다</div>
+
+<h2>14.1 왜 IaC인가</h2>
+<ul>
+<li><strong>재현성</strong>: dev/stg/prod를 같은 코드로. <strong>리뷰 가능</strong>: 변경을 PR로 검토. <strong>복구</strong>: 리전 DR 시 코드로 재구축. <strong>정리</strong>: 실습 후 한 번에 삭제.</li>
+</ul>
+<table>
+<tr><th>도구</th><th>언어</th><th>상태 관리</th><th>특징</th></tr>
+<tr><td>CloudFormation</td><td>YAML/JSON</td><td>AWS가 스택으로 관리</td><td>AWS 네이티브, 변경 세트, 드리프트 탐지, StackSets(다계정 배포)</td></tr>
+<tr><td>AWS CDK</td><td>TypeScript, Python 등</td><td>CloudFormation으로 합성</td><td>프로그래밍 언어의 추상화(Construct)</td></tr>
+<tr><td>Terraform / OpenTofu</td><td>HCL</td><td>state 파일(S3 백엔드 + 잠금)</td><td>멀티 클라우드, 거대한 모듈 생태계, plan으로 변경 미리보기</td></tr>
+</table>
+
+<h2>14.2 CloudFormation 예제: VPC + 퍼블릭 서브넷</h2>
+<pre>AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  VpcCidr: { Type: String, Default: 10.0.0.0/16 }
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: study-vpc }]
+  Igw: { Type: AWS::EC2::InternetGateway }
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]   <span class="c"># 10.0.0.0/24</span>
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  PublicRt: { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: { RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw }
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRt }
+Outputs:
+  VpcId: { Value: !Ref Vpc, Export: { Name: study-vpc-id } }</pre>
+<pre>aws cloudformation deploy --template-file vpc.yaml --stack-name study-vpc
+aws cloudformation delete-stack --stack-name study-vpc</pre>
+
+<h2>14.3 Terraform 예제: 3계층 VPC (모듈 없이 핵심만)</h2>
+<pre>terraform {
+  required_providers { aws = { source = "hashicorp/aws", version = "~> 6.0" } }
+  backend "s3" {                         <span class="c"># 팀 작업 시 원격 state</span>
+    bucket       = "my-tf-state-bucket"
+    key          = "study/vpc.tfstate"
+    region       = "ap-northeast-2"
+    use_lockfile = true
+  }
+}
+provider "aws" {
+  region = "ap-northeast-2"
+  default_tags { tags = { Project = "study" } }
+}
+locals {
+  azs  = ["ap-northeast-2a", "ap-northeast-2c"]
+  cidr = "10.0.0.0/16"
+}
+resource "aws_vpc" "main" {
+  cidr_block = local.cidr
+  enable_dns_hostnames = true
+}
+resource "aws_subnet" "public" {
+  count                   = length(local.azs)
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(local.cidr, 8, count.index + 1)   <span class="c"># 10.0.1.0/24, 10.0.2.0/24</span>
+  availability_zone       = local.azs[count.index]
+  map_public_ip_on_launch = true
+}
+resource "aws_subnet" "app" {
+  count             = length(local.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(local.cidr, 8, count.index + 11)        <span class="c"># 10.0.11.0/24 …</span>
+  availability_zone = local.azs[count.index]
+}
+resource "aws_internet_gateway" "igw" { vpc_id = aws_vpc.main.id }
+resource "aws_eip" "nat" {
+  count  = length(local.azs)
+  domain = "vpc"
+}
+resource "aws_nat_gateway" "nat" {
+  count         = length(local.azs)                <span class="c"># AZ마다 NAT (고가용성)</span>
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+}
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+}
+resource "aws_route_table" "app" {
+  count  = length(local.azs)
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat[count.index].id
+  }
+}
+resource "aws_route_table_association" "public" {
+  count = length(local.azs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+resource "aws_route_table_association" "app" {
+  count = length(local.azs)
+  subnet_id      = aws_subnet.app[count.index].id
+  route_table_id = aws_route_table.app[count.index].id
+}
+resource "aws_vpc_endpoint" "s3" {                 <span class="c"># NAT 비용 절감</span>
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.ap-northeast-2.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = aws_route_table.app[*].id
+}</pre>
+<pre>terraform init && terraform plan -out tfplan && terraform apply tfplan
+terraform destroy      <span class="c"># 실습 후 반드시 정리 (NAT GW는 시간당 과금!)</span></pre>
+<div class="box tip"><b class="t">💡 실무 팁</b>검증된 커뮤니티 모듈(<code>terraform-aws-modules/vpc/aws</code>)로 시작해도 좋지만, 처음에는 위처럼 리소스를 직접 작성해 보며 각 리소스의 관계를 익히는 것을 추천합니다. state 파일에는 비밀값이 들어갈 수 있으니 S3 암호화·접근 제한을 하세요.</div>
+
+<!-- ============================================================ -->
+<h1 class="chapter"><span class="no">CHAPTER 15</span>고가용성·재해 복구·비용 최적화</h1>
+<div class="goal"><b>학습 목표</b> · RTO/RPO로 요구사항을 수치화한다 · DR 전략 4가지를 비용·복구 시간으로 비교한다 · 비용 구조(특히 데이터 전송)를 이해하고 줄인다</div>
+
+<h2>15.1 고가용성 설계 원칙</h2>
+<ul>
+<li><strong>단일 장애점(SPOF) 제거</strong>: 모든 계층을 최소 2개 AZ에. NAT GW도 AZ별로.</li>
+<li><strong>상태 비저장(Stateless) 앱</strong>: 세션·파일을 인스턴스 밖(ElastiCache, DynamoDB, S3, EFS)으로 → 자유로운 확장·교체.</li>
+<li><strong>느슨한 결합</strong>: 큐로 계층 분리 → 한 계층 장애가 전체로 번지지 않음.</li>
+<li><strong>자동 복구</strong>: ASG + ELB 헬스 체크, RDS Multi-AZ, Route 53 장애 조치.</li>
+<li><strong>재시도 + 지수 백오프 + 지터</strong>, 타임아웃, 서킷 브레이커.</li>
+<li><strong>정적 안정성(Static Stability)</strong>: 장애 시 새 자원을 만들지 않아도 버틸 만큼 미리 확보(예: 3 AZ에 각 50% 용량 → 1 AZ 손실 시에도 100%).</li>
+</ul>
+
+<h2>15.2 RTO / RPO</h2>
+<p><strong>RPO(Recovery Point Objective)</strong>: 얼마만큼의 데이터 손실을 허용하는가(시간). <strong>RTO(Recovery Time Objective)</strong>: 서비스가 복구되기까지 허용 시간.</p>
+<table>
+<tr><th style="width:22%">DR 전략</th><th>방식</th><th style="width:15%">RPO/RTO</th><th style="width:10%">비용</th></tr>
+<tr><td>백업 & 복원</td><td>다른 리전에 백업(AWS Backup, 스냅샷 복사, S3 CRR). 장애 시 IaC로 재구축 후 복원</td><td>시간 / 수 시간~하루</td><td>$</td></tr>
+<tr><td>파일럿 라이트</td><td>DB 등 핵심 데이터만 상시 복제, 앱 서버는 꺼두거나 AMI만 준비</td><td>분 / 수십 분</td><td>$$</td></tr>
+<tr><td>웜 스탠바이</td><td>축소된 규모의 전체 환경이 상시 동작, 장애 시 확장 + DNS 전환</td><td>초~분 / 분</td><td>$$$</td></tr>
+<tr><td>멀티 사이트 액티브-액티브</td><td>여러 리전이 동시에 트래픽 처리(Aurora Global, DynamoDB Global Tables, Route 53 지연/가중치)</td><td>거의 0 / 거의 0</td><td>$$$$</td></tr>
+</table>
+<p><strong>AWS Elastic Disaster Recovery(DRS)</strong>는 서버 블록 수준 지속 복제로 온프레미스/타 리전 서버의 DR을 저비용으로 구성합니다. <strong>DR 훈련</strong>을 정기적으로 하지 않은 DR 계획은 동작하지 않는다고 가정하세요. <strong>AWS Fault Injection Service</strong>로 장애를 주입해 검증할 수 있습니다.</p>
+
+<h2>15.3 비용 구조와 최적화</h2>
+<h3>데이터 전송 요금 — 가장 헷갈리는 부분</h3>
+<table>
+<tr><th>흐름</th><th>요금(일반적)</th></tr>
+<tr><td>인터넷 → AWS (인바운드)</td><td>무료</td></tr>
+<tr><td>AWS → 인터넷 (아웃바운드)</td><td>GB당 과금(월 100 GB 무료 포함 구간 있음) — CloudFront 경유가 대개 저렴</td></tr>
+<tr><td>같은 AZ 내 사설 IP 통신</td><td>무료</td></tr>
+<tr><td>AZ 간 통신</td><td>양방향 GB당 과금 (RDS Multi-AZ 복제는 무료)</td></tr>
+<tr><td>리전 간</td><td>GB당 과금</td></tr>
+<tr><td>NAT Gateway</td><td>시간 + 처리 GB당 (+ 이후 인터넷 전송 요금)</td></tr>
+<tr><td>VPC 엔드포인트(게이트웨이)</td><td>무료</td></tr>
+<tr><td>TGW</td><td>Attachment 시간 + 처리 GB당</td></tr>
+</table>
+<h3>비용 최적화 체크리스트</h3>
+<ol>
+<li><strong>가시화</strong>: 비용 할당 태그, Cost Explorer, Budgets, Cost Anomaly Detection, CUR(상세 보고서).</li>
+<li><strong>Right-sizing</strong>: Compute Optimizer 권고 반영, 과대 인스턴스 축소.</li>
+<li><strong>약정</strong>: 안정 사용량에 Savings Plans.</li>
+<li><strong>스팟</strong>: 배치·CI·상태 비저장 워커.</li>
+<li><strong>Graviton</strong> 전환, gp2 → gp3 전환.</li>
+<li><strong>스케줄</strong>: 개발 환경은 업무 시간 외 중지(Instance Scheduler).</li>
+<li><strong>스토리지 계층화</strong>: S3 수명 주기·Intelligent-Tiering, 오래된 스냅샷 정리.</li>
+<li><strong>네트워크</strong>: S3/DynamoDB 게이트웨이 엔드포인트, AZ 간 트래픽 최소화, CloudFront로 아웃바운드 절감, 미사용 EIP·퍼블릭 IPv4 정리.</li>
+<li><strong>서버리스·관리형</strong>으로 유휴 비용 제거.</li>
+<li><strong>로그 보존 기간</strong> 설정(CloudWatch Logs 무기한 보존 방지).</li>
+</ol>
